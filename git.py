@@ -16,6 +16,7 @@ from datetime import datetime, timezone, timedelta
 import tkinter as tk
 from tkinter import messagebox
 
+# 实例检测：防止程序重复启动
 try:
     instance_lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     instance_lock.bind(('127.0.0.1', 58763)) 
@@ -34,6 +35,7 @@ def get_free_port():
 
 CURRENT_PORT = get_free_port()
 
+# 设置全局代理环境（针对 GitHub API）
 os.environ["http_proxy"] = "http://127.0.0.1:10808"
 os.environ["https_proxy"] = "http://127.0.0.1:10808"
 
@@ -46,7 +48,7 @@ try:
 except ImportError:
     root = tk.Tk()
     root.withdraw()
-    messagebox.showerror("缺少依赖", "请先在终端运行：\npip install -r requirements.txt")
+    messagebox.showerror("缺少依赖", "请先在终端运行：\npip install flask dulwich pystray pillow")
     sys.exit()
 
 def get_resource_path(relative_path):
@@ -147,6 +149,7 @@ HTML_TEMPLATE = """
 
         .list-item { background: #ffffff; padding: 14px; border-radius: 8px; border: 1px solid #e2e8f0; display: flex; flex-direction: column; gap: 8px; transition: box-shadow 0.2s; box-shadow: 0 1px 2px rgba(0,0,0,0.02);}
         .list-item:hover { box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-color: #cbd5e1; }
+        .list-item.active { border-color: var(--primary); background: #eff6ff; }
         
         .item-header { display: flex; justify-content: space-between; align-items: center; }
         .item-name { font-weight: 600; font-size: 15px; color: #0f172a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
@@ -211,7 +214,7 @@ HTML_TEMPLATE = """
             <h3 id="alert-title">提示</h3>
             <p id="alert-msg"></p>
             <div class="modal-actions">
-                <button class="btn-primary btn-full" id="btn-alert-ok">我已知晓</button>
+                <button class="btn-primary" id="btn-alert-ok" style="width: 100%;">我已知晓</button>
             </div>
         </div>
     </div>
@@ -305,6 +308,8 @@ HTML_TEMPLATE = """
         let cloudRepos = [];
         let localRepos = [];
         let repoToRecreate = null;
+        let selectedLocalIndex = -1;
+        let selectedCloudIndex = -1;
 
         function customAlert(msg, title="提示") {
             return new Promise(resolve => {
@@ -564,12 +569,21 @@ HTML_TEMPLATE = """
             } else if (checkData.status === 'need_push') {
                 if(await customConfirm(checkData.msg, "推送确认")) {
                     const p = await apiCall('/api/push', 'POST', {name: repo.name, url: repo.repo_url});
-                    if(p.log && p.log.includes('✅')) { showToast("推送成功"); await loadLocalRepos(); }
+                    if(p.log && p.log.includes('✅')) { 
+                        showToast("推送成功"); 
+                        await loadLocalRepos(); 
+                        // [关键改动]：推送成功关闭模态框后，执行一次云端刷新
+                        await fetchCloudRepos(); 
+                    }
                 } else { log("已取消推送。"); }
             } else if (checkData.status === 'need_pull') {
                 if(await customConfirm(checkData.msg, "覆盖确认")) {
                     const p = await apiCall('/api/pull_update', 'POST', {name: repo.name, url: repo.repo_url});
-                    if(p.log && p.log.includes('✅')) { showToast("拉取覆盖成功"); await loadLocalRepos(); }
+                    if(p.log && p.log.includes('✅')) { 
+                        showToast("拉取覆盖成功"); 
+                        await loadLocalRepos(); 
+                        await fetchCloudRepos(); 
+                    }
                 } else { log("已取消拉取。"); }
             } else if (checkData.status === 'ok') {
                 showToast("已经是最新状态", "success");
@@ -649,6 +663,7 @@ HTML_TEMPLATE = """
                 showToast(`新项目 ${name} 创建成功`);
                 closeModal();
                 await loadLocalRepos();
+                await fetchCloudRepos();
             }
             setLoading('btn-create', false);
         }
@@ -1134,7 +1149,7 @@ class LauncherApp:
         
         self.start_btn.config(text="🌐 后台守护运行中...", bg="#64748b", state=tk.DISABLED)
         
-        threading.Thread(target=lambda: app.run(port=CURRENT_PORT, use_reloader=False), daemon=True).start()
+        threading.Thread(target=lambda: app.run(port=CURRENT_PORT, host='127.0.0.1', use_reloader=False), daemon=True).start()
         threading.Thread(target=create_systray, daemon=True).start()
         
         webbrowser.open(f"http://127.0.0.1:{CURRENT_PORT}")
