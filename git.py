@@ -11,40 +11,22 @@ import webbrowser
 import subprocess
 import time
 import socket
+import ssl
 from datetime import datetime, timezone, timedelta
 import tkinter as tk
 from tkinter import messagebox
 
-# 新增必备依赖
-try:
-    from flask import Flask, request, jsonify, render_template_string, Response
-    from dulwich import porcelain
-    from dulwich.repo import Repo
-    import pystray
-    from PIL import Image, ImageDraw, ImageFont
-except ImportError:
-    root = tk.Tk()
-    root.withdraw()
-    messagebox.showerror("缺少依赖", "请先在终端运行：\npip install flask dulwich pystray Pillow")
-    sys.exit()
-
 # ==========================================
-# 保证程序单例运行 (Mutex 锁)
+# 保证程序单例运行 (Mutex 锁，彻底杜绝多开)
 # ==========================================
 try:
     instance_lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    instance_lock.bind(('127.0.0.1', 58763)) # 用一个偏僻的高位端口作为唯一运行锁
+    instance_lock.bind(('127.0.0.1', 58763)) # 用高位冷门端口作为唯一运行锁
 except Exception:
     root = tk.Tk()
     root.withdraw()
-    messagebox.showwarning("提示", "软件已经在运行中了！\n请查看电脑右下角的系统托盘图标。")
+    messagebox.showwarning("拦截提示", "程序已经在后台运行中了！\n请查看电脑右下角的系统托盘图标。")
     sys.exit(0)
-
-# ==========================================
-# 针对 v2rayN 的网络代理设置 (默认端口 10808)
-os.environ["http_proxy"] = "http://127.0.0.1:10808"
-os.environ["https_proxy"] = "http://127.0.0.1:10808"
-# ==========================================
 
 # ==========================================
 # 动态随机分配 Flask 端口
@@ -59,7 +41,25 @@ def get_free_port():
 CURRENT_PORT = get_free_port()
 
 # ==========================================
-# 资源与数据库路径管理 (兼容 PyInstaller)
+# 针对 v2rayN 的网络代理设置 (默认端口 10808)
+os.environ["http_proxy"] = "http://127.0.0.1:10808"
+os.environ["https_proxy"] = "http://127.0.0.1:10808"
+# ==========================================
+
+try:
+    from flask import Flask, request, jsonify, render_template_string, Response
+    from dulwich import porcelain
+    from dulwich.repo import Repo
+    import pystray
+    from PIL import Image, ImageDraw, ImageTk
+except ImportError:
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showerror("缺少依赖", "请先在终端运行：\npip install -r requirements.txt")
+    sys.exit()
+
+# ==========================================
+# 资源与数据库路径管理 (兼容 PyInstaller 打包)
 # ==========================================
 def get_resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
@@ -119,7 +119,7 @@ def update_last_sync(name):
 init_db()
 
 # ==========================================
-# 前端 HTML/CSS/JS (SSE 毫秒级断线自毁版)
+# 前端 HTML/CSS/JS (SSE 断线秒关版)
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -216,9 +216,9 @@ HTML_TEMPLATE = """
     <div id="toast-container"></div>
     
     <div id="offline-overlay">
-        <div style="font-size: 50px; margin-bottom: 20px;" id="offline-icon">🔌</div>
-        <h2 style="margin:0; font-size: 28px;" id="offline-title">服务端已断开连接</h2>
-        <p style="color: #94a3b8; margin-top: 15px;" id="offline-desc">安全自毁程序启动，正在关闭窗口...</p>
+        <div style="font-size: 50px; margin-bottom: 20px;">🔌</div>
+        <h2 style="margin:0; font-size: 28px;">服务端已断开连接</h2>
+        <p style="color: #94a3b8; margin-top: 15px;">后台守护进程已退出，正在自动关闭窗口...</p>
     </div>
 
     <div id="custom-alert-modal" class="modal">
@@ -405,8 +405,7 @@ HTML_TEMPLATE = """
             }
         }
 
-        // ================= 核心：SSE 流式实时断线自毁机制 =================
-        // 彻底解决后台标签页被休眠导致 setInterval 停摆的问题
+        // ================= 核心：SSE 毫秒级断线自毁机制 =================
         const evtSource = new EventSource('/api/stream');
         evtSource.onerror = function() {
             document.getElementById('offline-overlay').style.display = 'flex';
@@ -469,7 +468,6 @@ HTML_TEMPLATE = """
             }
         }
 
-        // ================= 渲染本地列表 =================
         async function loadLocalRepos() {
             const data = await apiCall('/api/local_repos', 'GET');
             const container = document.getElementById('local-list');
@@ -508,7 +506,6 @@ HTML_TEMPLATE = """
             }
         }
 
-        // ================= 渲染云端列表 =================
         async function fetchCloudRepos() {
             setLoading('btn-fetch', true);
             log("正在向 GitHub 请求云端列表...");
@@ -554,7 +551,6 @@ HTML_TEMPLATE = """
             setLoading('btn-fetch', false);
         }
 
-        // ================= 具体操作逻辑 =================
         async function pullProject(idx, event) {
             if(event) event.stopPropagation();
             const btnId = `btn-pull-${idx}`;
@@ -755,11 +751,6 @@ def get_project_mtime(p_path):
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/api/ping', methods=['GET'])
-def api_ping():
-    return jsonify({"status": "ok"})
-
-# 核心：使用 Server-Sent Events (SSE) 创建死链接。后端一退，前端瞬间感知并关窗
 @app.route('/api/stream')
 def api_stream():
     def generate():
@@ -770,6 +761,10 @@ def api_stream():
         except GeneratorExit:
             pass
     return Response(generate(), mimetype='text/event-stream')
+
+@app.route('/api/ping', methods=['GET'])
+def api_ping():
+    return jsonify({"status": "ok"})
 
 @app.route('/api/init_info', methods=['GET'])
 def api_init_info():
@@ -784,6 +779,7 @@ def api_local_repos():
     conn.close()
     
     valid_repos = []
+    
     for r in rows:
         p_name, origin, repo_url, last_sync = r[0], r[1], r[2], r[3]
         p_path = os.path.join(BASE_DIR, p_name)
@@ -1079,24 +1075,43 @@ def api_create():
 
 
 # ==========================================
-# 系统托盘与图标生成逻辑
+# 系统托盘与图标管理
 # ==========================================
-def get_app_icon():
-    """读取真实目录下的图标，如果没有则自动生成一个兜底的防闪退图标"""
-    # 尝试加载当前目录或打包后的临时目录中的 app_icon.png
+def get_tray_icon():
+    """读取用户自定义的托盘图标 app_icon.png，没有则兜底"""
     png_path = get_resource_path("app_icon.png")
     if os.path.exists(png_path):
         return Image.open(png_path)
     
-    # 兜底：如果找不到图标，动态画一个蓝色的方块，防止 pystray 报错
     img = Image.new('RGB', (64, 64), color=(59, 130, 246))
     d = ImageDraw.Draw(img)
     d.text((16, 24), "Git", fill=(255, 255, 255))
     return img
 
+def set_tkinter_icon(root):
+    """自动从 GitHub 官方抓取原汁原味的图标赋予 Tkinter (Tkinter不认SVG)"""
+    try:
+        icon_path = get_resource_path("github_icon.png")
+        if not os.path.exists(icon_path):
+            req = urllib.request.Request("https://github.githubassets.com/favicons/favicon.png", headers={'User-Agent': 'Mozilla/5.0'})
+            # 屏蔽证书校验，防止部分电脑因为内置根证书过期导致下载失败
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=3, context=ctx) as res:
+                with open(icon_path, 'wb') as f:
+                    f.write(res.read())
+        
+        img = Image.open(icon_path)
+        photo = ImageTk.PhotoImage(img)
+        root.iconphoto(True, photo)
+        root._window_icon = photo # 保持引用，防止被 Python 垃圾回收销毁
+    except Exception:
+        pass
+
 def create_systray():
     global systray_icon
-    image = get_app_icon()
+    image = get_tray_icon()
     menu = pystray.Menu(
         pystray.MenuItem("显示窗口", lambda: app_launcher.root.after(0, app_launcher.root.deiconify)),
         pystray.MenuItem("进入 Web 页", lambda: webbrowser.open(f"http://127.0.0.1:{CURRENT_PORT}")),
@@ -1106,44 +1121,25 @@ def create_systray():
     systray_icon.run()
 
 def exit_app():
-    """安全退出：销毁托盘、关闭界面、杀进程"""
     if 'systray_icon' in globals():
         systray_icon.stop()
     os._exit(0)
 
 # ==========================================
-# 启动器逻辑
+# 极简启动器 (托盘后台守护)
 # ==========================================
 class LauncherApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("GitHub 工作台启动器")
+        self.root.title("GitHub Server Starter")
         self.root.geometry("400x150")
         self.root.eval('tk::PlaceWindow . center')
         
-        # 加载窗口图标 app_icon.ico (如果存在的话)
-        ico_path = get_resource_path("app_icon.ico")
-        if os.path.exists(ico_path):
-            try: self.root.iconbitmap(ico_path)
-            except Exception: pass
-            
-        # 拦截关闭按钮 (X)，改为隐藏窗口到托盘
-        self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
+        # 换成你想要的纯正 GitHub 图标
+        set_tkinter_icon(self.root)
         
-        # 防多开检测 (只拉起网页，不弹窗报错)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.1)
-        # 通过去连当前程序的专属 Mutex 端口来判断是否已经运行
-        if s.connect_ex(('127.0.0.1', 58763)) == 0:
-            s.close()
-            # 找到之前存下的动态端口直接打开即可
-            # (如果之前没存，其实没法知道分配的随机端口，所以这里优化：
-            # 既然要使用随机端口，且为了允许新开进程直接呼出网页，
-            # 最优雅的做法是依然使用固定端口 5000 作为 Web 服务端口，
-            # 只去掉底层无用的多余判断即可。由于你要求“使用随机端口”，我在这里保留设计)
-            messagebox.showwarning("提示", "程序已经在后台运行！\n请在电脑右下角的系统托盘处找到图标并点击「进入 Web 页」。")
-            sys.exit(0)
-        s.close()
+        # 拦截右上角 X 号，改为隐藏到托盘
+        self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
         
         tk.Label(root, text="Personal Access Token:", font=("Arial", 10, "bold")).pack(pady=(15, 5))
         self.token_var = tk.StringVar(value=get_token())
@@ -1153,13 +1149,11 @@ class LauncherApp:
         self.start_btn = tk.Button(root, text="🚀 启动 Web 工作台", bg="#3b82f6", fg="white", font=("Arial", 10, "bold"), command=self.start_server)
         self.start_btn.pack(pady=10)
 
-        # 核心需求：如果已有 Token，自动隐藏窗口进入托盘，并启动服务
-        if self.token_var.get().strip():
-            self.root.after(300, self.auto_start)
+        self.root.after(100, self.auto_start_check)
 
-    def auto_start(self):
-        self.root.withdraw() # 隐藏到托盘
-        self.start_server()
+    def auto_start_check(self):
+        if self.token_var.get().strip():
+            self.start_server()
 
     def start_server(self):
         token = self.token_var.get().strip()
@@ -1170,13 +1164,12 @@ class LauncherApp:
         
         self.start_btn.config(text="🌐 后台守护运行中...", bg="#64748b", state=tk.DISABLED)
         
-        # 启动后台服务
+        # 启动后台服务与托盘图标
         threading.Thread(target=lambda: app.run(port=CURRENT_PORT, use_reloader=False), daemon=True).start()
-        # 启动托盘图标
         threading.Thread(target=create_systray, daemon=True).start()
         
         webbrowser.open(f"http://127.0.0.1:{CURRENT_PORT}")
-        self.root.withdraw() # 确保点按钮时也隐藏
+        self.root.withdraw() # 隐藏主窗口
 
 if __name__ == "__main__":
     import logging
@@ -1184,5 +1177,6 @@ if __name__ == "__main__":
     log.setLevel(logging.ERROR)
     
     root = tk.Tk()
+    global app_launcher
     app_launcher = LauncherApp(root)
     root.mainloop()
