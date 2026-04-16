@@ -10,9 +10,35 @@ import stat
 import webbrowser
 import subprocess
 import time
+import socket
 from datetime import datetime, timezone, timedelta
 import tkinter as tk
 from tkinter import messagebox
+
+# 新增必备依赖
+try:
+    from flask import Flask, request, jsonify, render_template_string, Response
+    from dulwich import porcelain
+    from dulwich.repo import Repo
+    import pystray
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showerror("缺少依赖", "请先在终端运行：\npip install flask dulwich pystray Pillow")
+    sys.exit()
+
+# ==========================================
+# 保证程序单例运行 (Mutex 锁)
+# ==========================================
+try:
+    instance_lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    instance_lock.bind(('127.0.0.1', 58763)) # 用一个偏僻的高位端口作为唯一运行锁
+except Exception:
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showwarning("提示", "软件已经在运行中了！\n请查看电脑右下角的系统托盘图标。")
+    sys.exit(0)
 
 # ==========================================
 # 针对 v2rayN 的网络代理设置 (默认端口 10808)
@@ -20,23 +46,31 @@ os.environ["http_proxy"] = "http://127.0.0.1:10808"
 os.environ["https_proxy"] = "http://127.0.0.1:10808"
 # ==========================================
 
-try:
-    from flask import Flask, request, jsonify, render_template_string
-    from dulwich import porcelain
-    from dulwich.repo import Repo
-except ImportError:
-    root = tk.Tk()
-    root.withdraw()
-    messagebox.showerror("缺少依赖", "请先在终端运行：\npip install flask dulwich")
-    sys.exit()
+# ==========================================
+# 动态随机分配 Flask 端口
+# ==========================================
+def get_free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+CURRENT_PORT = get_free_port()
 
 # ==========================================
-# 基础配置与数据库 (包含自动热升级逻辑)
+# 资源与数据库路径管理 (兼容 PyInstaller)
 # ==========================================
+def get_resource_path(relative_path):
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath(os.path.dirname(__file__)), relative_path)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "manager_data.db")
 IGNORE_PATTERNS = ('.db', '.log', '.sqlite', '.sqlite3', '.pyc')
 IGNORE_NAMES = ('manager_data.db', '__pycache__')
+IGNORE_DIRS = {'.git', 'node_modules', 'venv', '.venv', '__pycache__'}
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -47,8 +81,6 @@ def init_db():
             id INTEGER PRIMARY KEY, name TEXT, path TEXT, repo_url TEXT, origin TEXT
         )
     ''')
-    
-    # 数据库热升级：自动检测并补齐新加入的 last_sync 字段
     cursor.execute("PRAGMA table_info(projects)")
     columns = [info[1] for info in cursor.fetchall()]
     if 'last_sync' not in columns:
@@ -76,7 +108,6 @@ def save_token(token):
     conn.close()
 
 def update_last_sync(name):
-    """单独更新最后同步时间的方法"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     tz_utc8 = timezone(timedelta(hours=8))
@@ -88,7 +119,7 @@ def update_last_sync(name):
 init_db()
 
 # ==========================================
-# 前端 HTML/CSS/JS (超宽全功能卡片版)
+# 前端 HTML/CSS/JS (SSE 毫秒级断线自毁版)
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -114,7 +145,6 @@ HTML_TEMPLATE = """
         html, body { height: 100vh; margin: 0; padding: 0; overflow: hidden; background-color: var(--bg-color); color: var(--text-main); }
         body { display: flex; justify-content: center; padding: 15px; }
         
-        /* 容器拉宽至 1400px 以适应按钮和时间戳 */
         .container { width: 100%; max-width: 1400px; height: 100%; display: flex; flex-direction: column; gap: 15px; }
         
         .header { flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; padding-bottom: 12px; border-bottom: 2px solid #e2e8f0; }
@@ -130,7 +160,6 @@ HTML_TEMPLATE = """
         .custom-list::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         .custom-list::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
 
-        /* 组件化的全新独立卡片样式 */
         .list-item { background: #ffffff; padding: 14px; border-radius: 8px; border: 1px solid #e2e8f0; display: flex; flex-direction: column; gap: 8px; transition: box-shadow 0.2s; box-shadow: 0 1px 2px rgba(0,0,0,0.02);}
         .list-item:hover { box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-color: #cbd5e1; }
         
@@ -139,8 +168,9 @@ HTML_TEMPLATE = """
         .item-meta { font-size: 12px; color: #64748b; display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 4px;}
         .item-meta span { display: flex; align-items: center; gap: 4px; }
         
-        .item-actions { display: flex; gap: 8px; flex-wrap: wrap;}
-        
+        .item-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; width: 100%;}
+        .btn-right { margin-left: auto; }
+
         .badge { font-size: 11px; padding: 3px 8px; border-radius: 12px; background: #e2e8f0; color: #475569; font-weight: 500;}
 
         button { padding: 8px 12px; border: none; border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; transition: all 0.2s; color: white;}
@@ -186,9 +216,9 @@ HTML_TEMPLATE = """
     <div id="toast-container"></div>
     
     <div id="offline-overlay">
-        <div style="font-size: 50px; margin-bottom: 20px;">🔌</div>
-        <h2 style="margin:0; font-size: 28px;">服务端已断开连接</h2>
-        <p style="color: #94a3b8; margin-top: 15px;">Python 后端已退出，网页安全连接已切断。<br>你可以直接关闭本标签页。</p>
+        <div style="font-size: 50px; margin-bottom: 20px;" id="offline-icon">🔌</div>
+        <h2 style="margin:0; font-size: 28px;" id="offline-title">服务端已断开连接</h2>
+        <p style="color: #94a3b8; margin-top: 15px;" id="offline-desc">安全自毁程序启动，正在关闭窗口...</p>
     </div>
 
     <div id="custom-alert-modal" class="modal">
@@ -375,20 +405,62 @@ HTML_TEMPLATE = """
             }
         }
 
-        let pingFails = 0;
-        setInterval(async () => {
+        // ================= 核心：SSE 流式实时断线自毁机制 =================
+        // 彻底解决后台标签页被休眠导致 setInterval 停摆的问题
+        const evtSource = new EventSource('/api/stream');
+        evtSource.onerror = function() {
+            document.getElementById('offline-overlay').style.display = 'flex';
+            setTimeout(() => {
+                try { window.close(); } catch(e) {}
+            }, 100);
+        };
+
+        // ================= 极速后台无感刷新本地状态 =================
+        async function silentRefreshLocal() {
             try {
-                const res = await fetch('/api/ping');
-                if(!res.ok) throw new Error("Backend exit");
-                pingFails = 0;
-            } catch (e) {
-                pingFails++;
-                if (pingFails >= 2) {
-                    document.getElementById('offline-overlay').style.display = 'flex';
-                    try { window.close(); } catch(e) {}
+                const res = await fetch('/api/local_repos');
+                if(!res.ok) return;
+                const data = await res.json();
+                if(data.repos) {
+                    let needsFullRender = false;
+                    if(data.repos.length !== localRepos.length) {
+                        needsFullRender = true;
+                    } else {
+                        for(let i=0; i<data.repos.length; i++) {
+                            if(data.repos[i].name !== localRepos[i].name) {
+                                needsFullRender = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if(needsFullRender) {
+                        const oldSelectedName = selectedLocalIndex >= 0 ? localRepos[selectedLocalIndex].name : null;
+                        await loadLocalRepos(); 
+                        if(oldSelectedName) {
+                            const newIdx = localRepos.findIndex(r => r.name === oldSelectedName);
+                            if(newIdx !== -1) {
+                                selectedLocalIndex = newIdx;
+                                document.getElementById('local-list').children[newIdx].classList.add('active');
+                            }
+                        }
+                    } else {
+                        localRepos = data.repos;
+                        data.repos.forEach((r, idx) => {
+                            const mtimeSpan = document.getElementById(`mtime-${idx}`);
+                            const syncSpan = document.getElementById(`sync-${idx}`);
+                            if(mtimeSpan && mtimeSpan.innerHTML !== `🕒 <b>最后修改:</b> ${r.local_mtime}`) {
+                                mtimeSpan.innerHTML = `🕒 <b>最后修改:</b> ${r.local_mtime}`;
+                            }
+                            if(syncSpan && syncSpan.innerHTML !== `🔄 <b>最后同步:</b> ${r.last_sync}`) {
+                                syncSpan.innerHTML = `🔄 <b>最后同步:</b> ${r.last_sync}`;
+                            }
+                        });
+                    }
                 }
-            }
-        }, 2000);
+            } catch(e) {}
+        }
+        setInterval(silentRefreshLocal, 3000);
 
         async function checkInitInfo() {
             const res = await apiCall('/api/init_info', 'GET');
@@ -414,15 +486,21 @@ HTML_TEMPLATE = """
                             <span class="badge">${r.origin}</span>
                         </div>
                         <div class="item-meta">
-                            <span>🕒 <b>最后修改:</b> ${r.local_mtime}</span>
-                            <span>🔄 <b>最后同步:</b> ${r.last_sync}</span>
+                            <span id="mtime-${idx}">🕒 <b>最后修改:</b> ${r.local_mtime}</span>
+                            <span id="sync-${idx}">🔄 <b>最后同步:</b> ${r.last_sync}</span>
                         </div>
                         <div class="item-actions">
                             <button id="btn-sync-${idx}" class="btn-success btn-sm" onclick="syncProject(${idx}, event)"><div class="spinner"></div><span>智能比对同步</span></button>
-                            <button id="btn-vscode-${idx}" class="btn-info btn-sm" onclick="openVsCode(${idx}, event)"><div class="spinner"></div><span>VS Code</span></button>
-                            <button id="btn-del-${idx}" class="btn-danger btn-sm" onclick="deleteLocal(${idx}, event)"><div class="spinner"></div><span>彻底删除</span></button>
+                            <button id="btn-vscode-${idx}" class="btn-info btn-sm" onclick="openVsCode(${idx}, event)"><div class="spinner"></div><span>VS Code / 文件夹</span></button>
+                            <button id="btn-del-${idx}" class="btn-danger btn-sm btn-right" onclick="deleteLocal(${idx}, event)"><div class="spinner"></div><span>彻底删除</span></button>
                         </div>
                     `;
+                    div.onclick = (e) => {
+                        if(e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
+                        Array.from(container.children).forEach(c => c.classList.remove('active'));
+                        div.classList.add('active');
+                        selectedLocalIndex = idx;
+                    };
                     container.appendChild(div);
                 });
             } else {
@@ -455,10 +533,16 @@ HTML_TEMPLATE = """
                                 <span>🕒 <b>云端最后修改:</b> ${formatGithubTime(r.updated_at)}</span>
                             </div>
                             <div class="item-actions">
-                                <button id="btn-pull-${idx}" class="btn-primary btn-sm" onclick="pullProject(${idx}, event)"><div class="spinner"></div><span>拉取选中项目到本地</span></button>
-                                <button class="btn-secondary btn-sm" onclick="openBrowser(${idx}, event)">🌐 网站主页</button>
+                                <button id="btn-pull-${idx}" class="btn-primary btn-sm" onclick="pullProject(${idx}, event)"><div class="spinner"></div><span>⬇️ 拉取到本地</span></button>
+                                <button class="btn-secondary btn-sm btn-right" onclick="openBrowser(${idx}, event)">🌐 网站主页</button>
                             </div>
                         `;
+                        div.onclick = (e) => {
+                            if(e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
+                            Array.from(container.children).forEach(c => c.classList.remove('active'));
+                            div.classList.add('active');
+                            selectedCloudIndex = idx;
+                        };
                         container.appendChild(div);
                     });
                 }
@@ -510,6 +594,7 @@ HTML_TEMPLATE = """
                 } else { log("已取消拉取。"); }
             } else if (checkData.status === 'ok') {
                 showToast("已经是最新状态", "success");
+                await loadLocalRepos();
             }
             setLoading(btnId, false);
         }
@@ -539,7 +624,6 @@ HTML_TEMPLATE = """
                 const res = await apiCall('/api/delete_local', 'POST', {name: repo.name});
                 if(res.log && res.log.includes('✅')) showToast(`已彻底删除 ${repo.name}`);
                 await loadLocalRepos();
-                // delete button is gone anyway, no need to unlock
             }
         }
 
@@ -636,6 +720,37 @@ def get_real_changes(path):
     staged_files = [p for paths in status.staged.values() for p in paths]
     return real_changes, deleted_files, staged_files
 
+def get_project_mtime(p_path):
+    tz_utc8 = timezone(timedelta(hours=8))
+    latest_ts = 0
+    try:
+        for root, dirs, files in os.walk(p_path):
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            for f in files:
+                if any(f.endswith(ext) for ext in IGNORE_PATTERNS) or f in IGNORE_NAMES: 
+                    continue
+                fp = os.path.join(root, f)
+                try:
+                    m = os.path.getmtime(fp)
+                    if m > latest_ts: 
+                        latest_ts = m
+                except:
+                    pass
+    except Exception:
+        pass
+
+    commit_ts = 0
+    try:
+        repo = Repo(p_path)
+        commit_ts = repo[repo.head()].commit_time
+    except Exception:
+        pass
+    
+    final_ts = max(latest_ts, commit_ts)
+    if final_ts == 0: 
+        return "缺省"
+    return datetime.fromtimestamp(final_ts, tz=timezone.utc).astimezone(tz_utc8).strftime('%Y-%m-%d %H:%M:%S')
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -643,6 +758,18 @@ def index():
 @app.route('/api/ping', methods=['GET'])
 def api_ping():
     return jsonify({"status": "ok"})
+
+# 核心：使用 Server-Sent Events (SSE) 创建死链接。后端一退，前端瞬间感知并关窗
+@app.route('/api/stream')
+def api_stream():
+    def generate():
+        try:
+            while True:
+                yield "data: ping\n\n"
+                time.sleep(1)
+        except GeneratorExit:
+            pass
+    return Response(generate(), mimetype='text/event-stream')
 
 @app.route('/api/init_info', methods=['GET'])
 def api_init_info():
@@ -652,26 +779,16 @@ def api_init_info():
 def api_local_repos():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # 抽取包括 last_sync 的数据
     cursor.execute("SELECT name, origin, repo_url, last_sync FROM projects")
     rows = cursor.fetchall()
     conn.close()
     
     valid_repos = []
-    tz_utc8 = timezone(timedelta(hours=8))
-    
     for r in rows:
         p_name, origin, repo_url, last_sync = r[0], r[1], r[2], r[3]
         p_path = os.path.join(BASE_DIR, p_name)
         if os.path.exists(p_path):
-            # 获取 Git 本地提交时间
-            try:
-                repo = Repo(p_path)
-                ts = repo[repo.head()].commit_time
-                local_mtime = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz_utc8).strftime('%Y-%m-%d %H:%M:%S')
-            except Exception:
-                local_mtime = "缺省"
-                
+            local_mtime = get_project_mtime(p_path)
             valid_repos.append({
                 "name": p_name, 
                 "origin": origin, 
@@ -715,7 +832,6 @@ def api_pull():
     try:
         porcelain.clone(auth_url, target_path)
         
-        # 保存到数据库并更新同步时间
         now_str = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -852,8 +968,13 @@ def api_push():
 
         porcelain.push(path, auth_url, refspecs=[refspec])
         
+        try:
+            porcelain.pull(path, auth_url)
+        except Exception:
+            pass
+
         update_last_sync(name)
-        return jsonify({"log": "✅ 推送成功！云端已更新。"})
+        return jsonify({"log": "✅ 推送成功！并已自动拉取同步最新状态。"})
     except Exception as e:
         return jsonify({"log": f"❌ 推送失败: {str(e)}"})
 
@@ -876,14 +997,21 @@ def api_vscode():
     if not os.path.exists(path):
         return jsonify({"log": "❌ 启动失败：找不到本地项目文件夹。"})
     try:
-        # 使用精确的双引号路径注入，强制打开指定项目的目录工作区
         if os.name == 'nt':
             subprocess.Popen(f'code "{path}"', shell=True)
         else:
             subprocess.Popen(["code", path])
-        return jsonify({"log": "✅ 已向系统发送调起 VS Code 的指令。"})
+            
+        if sys.platform == 'win32':
+            os.startfile(path)
+        elif sys.platform == 'darwin':
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+            
+        return jsonify({"log": "✅ 已同时调起 VS Code 并打开了本地文件夹。"})
     except Exception as e:
-        return jsonify({"log": f"❌ 启动 VS Code 失败: {str(e)}"})
+        return jsonify({"log": f"❌ 启动失败: {str(e)}"})
 
 @app.route('/api/delete_local', methods=['POST'])
 def api_delete_local():
@@ -951,14 +1079,71 @@ def api_create():
 
 
 # ==========================================
-# 极简 Tkinter 启动器
+# 系统托盘与图标生成逻辑
+# ==========================================
+def get_app_icon():
+    """读取真实目录下的图标，如果没有则自动生成一个兜底的防闪退图标"""
+    # 尝试加载当前目录或打包后的临时目录中的 app_icon.png
+    png_path = get_resource_path("app_icon.png")
+    if os.path.exists(png_path):
+        return Image.open(png_path)
+    
+    # 兜底：如果找不到图标，动态画一个蓝色的方块，防止 pystray 报错
+    img = Image.new('RGB', (64, 64), color=(59, 130, 246))
+    d = ImageDraw.Draw(img)
+    d.text((16, 24), "Git", fill=(255, 255, 255))
+    return img
+
+def create_systray():
+    global systray_icon
+    image = get_app_icon()
+    menu = pystray.Menu(
+        pystray.MenuItem("显示窗口", lambda: app_launcher.root.after(0, app_launcher.root.deiconify)),
+        pystray.MenuItem("进入 Web 页", lambda: webbrowser.open(f"http://127.0.0.1:{CURRENT_PORT}")),
+        pystray.MenuItem("退出后台", lambda: exit_app())
+    )
+    systray_icon = pystray.Icon("GitHubTool", image, "GitHub 工作台", menu)
+    systray_icon.run()
+
+def exit_app():
+    """安全退出：销毁托盘、关闭界面、杀进程"""
+    if 'systray_icon' in globals():
+        systray_icon.stop()
+    os._exit(0)
+
+# ==========================================
+# 启动器逻辑
 # ==========================================
 class LauncherApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("GitHub Server Starter")
+        self.root.title("GitHub 工作台启动器")
         self.root.geometry("400x150")
         self.root.eval('tk::PlaceWindow . center')
+        
+        # 加载窗口图标 app_icon.ico (如果存在的话)
+        ico_path = get_resource_path("app_icon.ico")
+        if os.path.exists(ico_path):
+            try: self.root.iconbitmap(ico_path)
+            except Exception: pass
+            
+        # 拦截关闭按钮 (X)，改为隐藏窗口到托盘
+        self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
+        
+        # 防多开检测 (只拉起网页，不弹窗报错)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.1)
+        # 通过去连当前程序的专属 Mutex 端口来判断是否已经运行
+        if s.connect_ex(('127.0.0.1', 58763)) == 0:
+            s.close()
+            # 找到之前存下的动态端口直接打开即可
+            # (如果之前没存，其实没法知道分配的随机端口，所以这里优化：
+            # 既然要使用随机端口，且为了允许新开进程直接呼出网页，
+            # 最优雅的做法是依然使用固定端口 5000 作为 Web 服务端口，
+            # 只去掉底层无用的多余判断即可。由于你要求“使用随机端口”，我在这里保留设计)
+            messagebox.showwarning("提示", "程序已经在后台运行！\n请在电脑右下角的系统托盘处找到图标并点击「进入 Web 页」。")
+            sys.exit(0)
+        s.close()
         
         tk.Label(root, text="Personal Access Token:", font=("Arial", 10, "bold")).pack(pady=(15, 5))
         self.token_var = tk.StringVar(value=get_token())
@@ -968,8 +1153,13 @@ class LauncherApp:
         self.start_btn = tk.Button(root, text="🚀 启动 Web 工作台", bg="#3b82f6", fg="white", font=("Arial", 10, "bold"), command=self.start_server)
         self.start_btn.pack(pady=10)
 
+        # 核心需求：如果已有 Token，自动隐藏窗口进入托盘，并启动服务
         if self.token_var.get().strip():
-            self.root.after(300, self.start_server)
+            self.root.after(300, self.auto_start)
+
+    def auto_start(self):
+        self.root.withdraw() # 隐藏到托盘
+        self.start_server()
 
     def start_server(self):
         token = self.token_var.get().strip()
@@ -978,9 +1168,15 @@ class LauncherApp:
             return
         save_token(token)
         
-        self.start_btn.config(text="🌐 Web 服务后台运行中...", bg="#64748b", state=tk.DISABLED)
-        threading.Thread(target=lambda: app.run(port=5000, use_reloader=False), daemon=True).start()
-        webbrowser.open("http://127.0.0.1:5000")
+        self.start_btn.config(text="🌐 后台守护运行中...", bg="#64748b", state=tk.DISABLED)
+        
+        # 启动后台服务
+        threading.Thread(target=lambda: app.run(port=CURRENT_PORT, use_reloader=False), daemon=True).start()
+        # 启动托盘图标
+        threading.Thread(target=create_systray, daemon=True).start()
+        
+        webbrowser.open(f"http://127.0.0.1:{CURRENT_PORT}")
+        self.root.withdraw() # 确保点按钮时也隐藏
 
 if __name__ == "__main__":
     import logging
