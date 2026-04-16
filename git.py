@@ -31,7 +31,7 @@ except ImportError:
     sys.exit()
 
 # ==========================================
-# 基础配置与数据库
+# 基础配置与数据库 (包含自动热升级逻辑)
 # ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "manager_data.db")
@@ -47,6 +47,13 @@ def init_db():
             id INTEGER PRIMARY KEY, name TEXT, path TEXT, repo_url TEXT, origin TEXT
         )
     ''')
+    
+    # 数据库热升级：自动检测并补齐新加入的 last_sync 字段
+    cursor.execute("PRAGMA table_info(projects)")
+    columns = [info[1] for info in cursor.fetchall()]
+    if 'last_sync' not in columns:
+        cursor.execute("ALTER TABLE projects ADD COLUMN last_sync TEXT DEFAULT '缺省'")
+
     cursor.execute("SELECT COUNT(*) FROM settings")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT INTO settings (token) VALUES ('')")
@@ -68,10 +75,20 @@ def save_token(token):
     conn.commit()
     conn.close()
 
+def update_last_sync(name):
+    """单独更新最后同步时间的方法"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    tz_utc8 = timezone(timedelta(hours=8))
+    now_str = datetime.now(tz_utc8).strftime('%Y-%m-%d %H:%M:%S')
+    c.execute("UPDATE projects SET last_sync = ? WHERE name = ?", (now_str, name))
+    conn.commit()
+    conn.close()
+
 init_db()
 
 # ==========================================
-# 前端 HTML/CSS/JS 
+# 前端 HTML/CSS/JS (超宽全功能卡片版)
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -88,6 +105,7 @@ HTML_TEMPLATE = """
             --danger: #ef4444; --danger-hover: #dc2626;
             --warning: #f59e0b; --warning-hover: #d97706;
             --info: #6366f1; --info-hover: #4f46e5;
+            --secondary: #64748b; --secondary-hover: #475569;
             --bg-color: #f8fafc; --card-bg: #ffffff;
             --text-main: #1e293b; --text-light: #64748b;
         }
@@ -96,7 +114,8 @@ HTML_TEMPLATE = """
         html, body { height: 100vh; margin: 0; padding: 0; overflow: hidden; background-color: var(--bg-color); color: var(--text-main); }
         body { display: flex; justify-content: center; padding: 15px; }
         
-        .container { width: 100%; max-width: 1200px; height: 100%; display: flex; flex-direction: column; gap: 15px; }
+        /* 容器拉宽至 1400px 以适应按钮和时间戳 */
+        .container { width: 100%; max-width: 1400px; height: 100%; display: flex; flex-direction: column; gap: 15px; }
         
         .header { flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; padding-bottom: 12px; border-bottom: 2px solid #e2e8f0; }
         .header h1 { margin: 0; font-size: 22px; color: #0f172a; display: flex; align-items: center; gap: 10px; }
@@ -106,18 +125,24 @@ HTML_TEMPLATE = """
         .card { background: var(--card-bg); border-radius: 12px; padding: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; display: flex; flex-direction: column; min-height: 0;}
         .card h3 { margin-top: 0; margin-bottom: 12px; font-size: 16px; display: flex; align-items: center; gap: 8px; color: #334155; flex-shrink: 0;}
         
-        .custom-list { flex: 1; min-height: 0; overflow-y: auto; border: 1px solid #cbd5e1; border-radius: 8px; background: #f8fafc; padding: 6px; margin-bottom: 12px; }
+        .custom-list { flex: 1; min-height: 0; overflow-y: auto; border: 1px solid #cbd5e1; border-radius: 8px; background: #f8fafc; padding: 10px; margin-bottom: 0; display: flex; flex-direction: column; gap: 10px;}
         .custom-list::-webkit-scrollbar { width: 6px; }
         .custom-list::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         .custom-list::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
 
-        .list-item { padding: 10px 12px; margin-bottom: 6px; border-radius: 6px; cursor: pointer; transition: background-color 0.2s; display: flex; align-items: center; gap: 10px; font-size: 14px; color: #334155; border: 1px solid transparent;}
-        .list-item:hover { background: #e2e8f0; }
-        .list-item.active { background: #eff6ff; border-color: #bfdbfe; color: #1d4ed8; font-weight: 600; box-shadow: 0 2px 4px rgba(59, 130, 246, 0.1);}
-        .badge { font-size: 11px; padding: 3px 6px; border-radius: 12px; background: #e2e8f0; color: #475569; margin-left: auto; font-weight: normal;}
+        /* 组件化的全新独立卡片样式 */
+        .list-item { background: #ffffff; padding: 14px; border-radius: 8px; border: 1px solid #e2e8f0; display: flex; flex-direction: column; gap: 8px; transition: box-shadow 0.2s; box-shadow: 0 1px 2px rgba(0,0,0,0.02);}
+        .list-item:hover { box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-color: #cbd5e1; }
         
-        .controls { flex-shrink: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 8px;}
+        .item-header { display: flex; justify-content: space-between; align-items: center; }
+        .item-name { font-weight: 600; font-size: 15px; color: #0f172a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+        .item-meta { font-size: 12px; color: #64748b; display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 4px;}
+        .item-meta span { display: flex; align-items: center; gap: 4px; }
         
+        .item-actions { display: flex; gap: 8px; flex-wrap: wrap;}
+        
+        .badge { font-size: 11px; padding: 3px 8px; border-radius: 12px; background: #e2e8f0; color: #475569; font-weight: 500;}
+
         button { padding: 8px 12px; border: none; border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; transition: all 0.2s; color: white;}
         button:disabled { opacity: 0.6; cursor: not-allowed; }
         button:active:not(:disabled) { transform: translateY(1px); }
@@ -126,7 +151,8 @@ HTML_TEMPLATE = """
         .btn-danger { background: var(--danger); } .btn-danger:hover:not(:disabled) { background: var(--danger-hover); }
         .btn-warning { background: var(--warning); color: #fff;} .btn-warning:hover:not(:disabled) { background: var(--warning-hover); }
         .btn-info { background: var(--info); } .btn-info:hover:not(:disabled) { background: var(--info-hover); }
-        .btn-full { grid-column: 1 / -1; }
+        .btn-secondary { background: var(--secondary); } .btn-secondary:hover:not(:disabled) { background: var(--secondary-hover); }
+        .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 5px; }
 
         .spinner { display: none; width: 12px; height: 12px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: #fff; animation: spin 1s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -220,24 +246,11 @@ HTML_TEMPLATE = """
             <div class="card">
                 <h3>💻 本地已拉取项目</h3>
                 <div id="local-list" class="custom-list"></div>
-                <div class="controls">
-                    <button class="btn-success btn-full" id="btn-sync" onclick="syncProject()">
-                        <div class="spinner"></div><span>🔄 智能比对同步</span>
-                    </button>
-                    <button class="btn-info" onclick="openVsCode()">📝 VS Code</button>
-                    <button class="btn-primary" onclick="openBrowser()" style="background:#475569">🌐 网页主页</button>
-                    <button class="btn-danger" id="btn-del" onclick="deleteLocal()">🗑️ 彻底删除</button>
-                </div>
             </div>
 
             <div class="card">
                 <h3>☁️ 云端仓库列表</h3>
                 <div id="cloud-list" class="custom-list"></div>
-                <div class="controls">
-                    <button class="btn-primary btn-full" id="btn-pull" onclick="pullProject()">
-                        <div class="spinner"></div><span>⬇️ 拉取选中项目到本地</span>
-                    </button>
-                </div>
             </div>
         </div>
 
@@ -276,8 +289,6 @@ HTML_TEMPLATE = """
     <script>
         let cloudRepos = [];
         let localRepos = [];
-        let selectedCloudIndex = -1;
-        let selectedLocalIndex = -1;
         let repoToRecreate = null;
 
         function customAlert(msg, title="提示") {
@@ -287,10 +298,7 @@ HTML_TEMPLATE = """
                 const modal = document.getElementById('custom-alert-modal');
                 const btn = document.getElementById('btn-alert-ok');
                 modal.style.display = 'flex';
-                btn.onclick = () => {
-                    modal.style.display = 'none';
-                    resolve();
-                };
+                btn.onclick = () => { modal.style.display = 'none'; resolve(); };
             });
         }
 
@@ -343,6 +351,17 @@ HTML_TEMPLATE = """
             }
         }
 
+        function formatGithubTime(isoStr) {
+            if(!isoStr) return "缺省";
+            const d = new Date(isoStr);
+            const y = d.getFullYear();
+            const m = String(d.getMonth()+1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            const h = String(d.getHours()).padStart(2, '0');
+            const min = String(d.getMinutes()).padStart(2, '0');
+            return `${y}-${m}-${day} ${h}:${min}`;
+        }
+
         async function apiCall(endpoint, method='POST', body=null) {
             try {
                 const options = { method: method, headers: {'Content-Type': 'application/json'} };
@@ -378,37 +397,46 @@ HTML_TEMPLATE = """
             }
         }
 
+        // ================= 渲染本地列表 =================
         async function loadLocalRepos() {
             const data = await apiCall('/api/local_repos', 'GET');
             const container = document.getElementById('local-list');
             container.innerHTML = '';
-            selectedLocalIndex = -1;
             
             if(data.repos && data.repos.length > 0) {
                 localRepos = data.repos;
                 localRepos.forEach((r, idx) => {
                     const div = document.createElement('div');
                     div.className = 'list-item';
-                    div.innerHTML = `📦 <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${r.name}</span> <span class="badge">${r.origin}</span>`;
-                    div.onclick = () => {
-                        Array.from(container.children).forEach(c => c.classList.remove('active'));
-                        div.classList.add('active');
-                        selectedLocalIndex = idx;
-                    };
+                    div.innerHTML = `
+                        <div class="item-header">
+                            <span class="item-name">📦 ${r.name}</span>
+                            <span class="badge">${r.origin}</span>
+                        </div>
+                        <div class="item-meta">
+                            <span>🕒 <b>最后修改:</b> ${r.local_mtime}</span>
+                            <span>🔄 <b>最后同步:</b> ${r.last_sync}</span>
+                        </div>
+                        <div class="item-actions">
+                            <button id="btn-sync-${idx}" class="btn-success btn-sm" onclick="syncProject(${idx}, event)"><div class="spinner"></div><span>智能比对同步</span></button>
+                            <button id="btn-vscode-${idx}" class="btn-info btn-sm" onclick="openVsCode(${idx}, event)"><div class="spinner"></div><span>VS Code</span></button>
+                            <button id="btn-del-${idx}" class="btn-danger btn-sm" onclick="deleteLocal(${idx}, event)"><div class="spinner"></div><span>彻底删除</span></button>
+                        </div>
+                    `;
                     container.appendChild(div);
                 });
             } else {
-                container.innerHTML = '<div style="padding:20px; text-align:center; color:#94a3b8; font-size:13px;">暂无本地拉取的项目</div>';
+                container.innerHTML = '<div style="padding:20px; text-align:center; color:#94a3b8; font-size:13px;">暂无本地项目</div>';
             }
         }
 
+        // ================= 渲染云端列表 =================
         async function fetchCloudRepos() {
             setLoading('btn-fetch', true);
             log("正在向 GitHub 请求云端列表...");
             const data = await apiCall('/api/fetch_cloud', 'POST');
             const container = document.getElementById('cloud-list');
             container.innerHTML = '';
-            selectedCloudIndex = -1;
 
             if (data.status === 'success') {
                 cloudRepos = data.repos;
@@ -418,12 +446,19 @@ HTML_TEMPLATE = """
                     cloudRepos.forEach((r, idx) => {
                         const div = document.createElement('div');
                         div.className = 'list-item';
-                        div.innerHTML = `☁️ <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${r.name}</span> ${r.private ? '<span class="badge" style="background:#fef08a;color:#854d0e;">私有</span>' : ''}`;
-                        div.onclick = () => {
-                            Array.from(container.children).forEach(c => c.classList.remove('active'));
-                            div.classList.add('active');
-                            selectedCloudIndex = idx;
-                        };
+                        div.innerHTML = `
+                            <div class="item-header">
+                                <span class="item-name">☁️ ${r.name}</span>
+                                ${r.private ? '<span class="badge" style="background:#fef08a;color:#854d0e;">私有</span>' : ''}
+                            </div>
+                            <div class="item-meta">
+                                <span>🕒 <b>云端最后修改:</b> ${formatGithubTime(r.updated_at)}</span>
+                            </div>
+                            <div class="item-actions">
+                                <button id="btn-pull-${idx}" class="btn-primary btn-sm" onclick="pullProject(${idx}, event)"><div class="spinner"></div><span>拉取选中项目到本地</span></button>
+                                <button class="btn-secondary btn-sm" onclick="openBrowser(${idx}, event)">🌐 网站主页</button>
+                            </div>
+                        `;
                         container.appendChild(div);
                     });
                 }
@@ -435,28 +470,30 @@ HTML_TEMPLATE = """
             setLoading('btn-fetch', false);
         }
 
-        async function pullProject() {
-            if (selectedCloudIndex === -1) return await customAlert("请先在右侧选择一个云端项目！", "操作提示");
-            setLoading('btn-pull', true);
-            const repo = cloudRepos[selectedCloudIndex];
+        // ================= 具体操作逻辑 =================
+        async function pullProject(idx, event) {
+            if(event) event.stopPropagation();
+            const btnId = `btn-pull-${idx}`;
+            setLoading(btnId, true);
+            const repo = cloudRepos[idx];
             log(`开始拉取: ${repo.name}...`);
             const res = await apiCall('/api/pull', 'POST', {name: repo.name, url: repo.clone_url});
             if(res.log && res.log.includes('✅')) showToast(`已成功拉取 ${repo.name}`);
             await loadLocalRepos();
-            setLoading('btn-pull', false);
+            setLoading(btnId, false);
         }
 
-        async function syncProject() {
-            if (selectedLocalIndex === -1) return await customAlert("请先在左侧选择一个本地项目！", "操作提示");
-            setLoading('btn-sync', true);
-            const repo = localRepos[selectedLocalIndex];
+        async function syncProject(idx, event) {
+            if(event) event.stopPropagation();
+            const btnId = `btn-sync-${idx}`;
+            setLoading(btnId, true);
+            const repo = localRepos[idx];
             log(`开始智能分析 [${repo.name}] ...`);
             
             const checkData = await apiCall('/api/sync_check', 'POST', {name: repo.name, url: repo.repo_url});
             
             if (checkData.status === 'not_found') {
-                // 如果云端不存在 (404)
-                setLoading('btn-sync', false);
+                setLoading(btnId, false);
                 repoToRecreate = repo;
                 document.getElementById('recreate-is-private').checked = true;
                 document.getElementById('recreate-modal').style.display = 'flex';
@@ -464,17 +501,46 @@ HTML_TEMPLATE = """
             } else if (checkData.status === 'need_push') {
                 if(await customConfirm(checkData.msg, "推送确认")) {
                     const p = await apiCall('/api/push', 'POST', {name: repo.name, url: repo.repo_url});
-                    if(p.log && p.log.includes('✅')) showToast("推送成功");
+                    if(p.log && p.log.includes('✅')) { showToast("推送成功"); await loadLocalRepos(); }
                 } else { log("已取消推送。"); }
             } else if (checkData.status === 'need_pull') {
                 if(await customConfirm(checkData.msg, "覆盖确认")) {
                     const p = await apiCall('/api/pull_update', 'POST', {name: repo.name, url: repo.repo_url});
-                    if(p.log && p.log.includes('✅')) showToast("拉取覆盖成功");
+                    if(p.log && p.log.includes('✅')) { showToast("拉取覆盖成功"); await loadLocalRepos(); }
                 } else { log("已取消拉取。"); }
             } else if (checkData.status === 'ok') {
                 showToast("已经是最新状态", "success");
             }
-            setLoading('btn-sync', false);
+            setLoading(btnId, false);
+        }
+
+        async function openVsCode(idx, event) {
+            if(event) event.stopPropagation();
+            const btnId = `btn-vscode-${idx}`;
+            setLoading(btnId, true);
+            const repo = localRepos[idx];
+            await apiCall('/api/vscode', 'POST', {name: repo.name});
+            setLoading(btnId, false);
+        }
+
+        function openBrowser(idx, event) {
+            if(event) event.stopPropagation();
+            const repo = cloudRepos[idx];
+            window.open(repo.html_url, '_blank');
+            log(`已在浏览器中打开: ${repo.html_url}`);
+        }
+
+        async function deleteLocal(idx, event) {
+            if(event) event.stopPropagation();
+            const repo = localRepos[idx];
+            if(await customConfirm(`警告：确定彻底删除本地的 [${repo.name}] 项目文件夹吗？\\n\\n该操作无法撤销，但不会影响 GitHub 云端代码。`, "⚠️ 危险操作确认")) {
+                const btnId = `btn-del-${idx}`;
+                setLoading(btnId, true);
+                const res = await apiCall('/api/delete_local', 'POST', {name: repo.name});
+                if(res.log && res.log.includes('✅')) showToast(`已彻底删除 ${repo.name}`);
+                await loadLocalRepos();
+                // delete button is gone anyway, no need to unlock
+            }
         }
 
         function closeRecreateModal() {
@@ -500,32 +566,6 @@ HTML_TEMPLATE = """
                 await fetchCloudRepos();
             }
             setLoading('btn-recreate', false);
-        }
-
-        async function openVsCode() {
-            if (selectedLocalIndex === -1) return await customAlert("请先选择一个本地项目！", "操作提示");
-            const repo = localRepos[selectedLocalIndex];
-            await apiCall('/api/vscode', 'POST', {name: repo.name});
-        }
-
-        function openBrowser() {
-            if (selectedLocalIndex === -1) return customAlert("请先选择一个本地项目！", "操作提示");
-            const repo = localRepos[selectedLocalIndex];
-            const webUrl = repo.repo_url.replace('.git', '');
-            window.open(webUrl, '_blank');
-            log(`已在浏览器中打开: ${webUrl}`);
-        }
-
-        async function deleteLocal() {
-            if (selectedLocalIndex === -1) return await customAlert("请先选择一个本地项目！", "操作提示");
-            const repo = localRepos[selectedLocalIndex];
-            if(await customConfirm(`警告：确定彻底删除本地的 [${repo.name}] 项目文件夹吗？\\n\\n该操作无法撤销，但不会影响 GitHub 云端代码。`, "⚠️ 危险操作确认")) {
-                setLoading('btn-del', true);
-                const res = await apiCall('/api/delete_local', 'POST', {name: repo.name});
-                if(res.log && res.log.includes('✅')) showToast(`已彻底删除 ${repo.name}`);
-                await loadLocalRepos();
-                setLoading('btn-del', false);
-            }
         }
 
         function showCreateModal() { 
@@ -612,14 +652,33 @@ def api_init_info():
 def api_local_repos():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT name, origin, repo_url FROM projects")
+    # 抽取包括 last_sync 的数据
+    cursor.execute("SELECT name, origin, repo_url, last_sync FROM projects")
     rows = cursor.fetchall()
     conn.close()
     
     valid_repos = []
+    tz_utc8 = timezone(timedelta(hours=8))
+    
     for r in rows:
-        if os.path.exists(os.path.join(BASE_DIR, r[0])):
-            valid_repos.append({"name": r[0], "origin": r[1], "repo_url": r[2]})
+        p_name, origin, repo_url, last_sync = r[0], r[1], r[2], r[3]
+        p_path = os.path.join(BASE_DIR, p_name)
+        if os.path.exists(p_path):
+            # 获取 Git 本地提交时间
+            try:
+                repo = Repo(p_path)
+                ts = repo[repo.head()].commit_time
+                local_mtime = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz_utc8).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                local_mtime = "缺省"
+                
+            valid_repos.append({
+                "name": p_name, 
+                "origin": origin, 
+                "repo_url": repo_url,
+                "last_sync": last_sync if last_sync else "缺省",
+                "local_mtime": local_mtime
+            })
     return jsonify({"repos": valid_repos})
 
 @app.route('/api/fetch_cloud', methods=['POST'])
@@ -655,11 +714,16 @@ def api_pull():
         return jsonify({"log": f"⚠️ 目录 {name} 已存在，跳过拉取。"})
     try:
         porcelain.clone(auth_url, target_path)
+        
+        # 保存到数据库并更新同步时间
+        now_str = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT INTO projects (name, path, repo_url, origin) VALUES (?, ?, ?, ?)", (name, target_path, clone_url, "Cloud"))
+        c.execute("INSERT INTO projects (name, path, repo_url, origin, last_sync) VALUES (?, ?, ?, ?, ?)", 
+                  (name, target_path, clone_url, "Cloud", now_str))
         conn.commit()
         conn.close()
+        
         return jsonify({"log": f"✅ {name} 已成功拉取到本地。"})
     except Exception as e:
         return jsonify({"log": f"❌ 拉取失败: {str(e)}"})
@@ -685,9 +749,8 @@ def api_sync_check():
                     remote_date_str = commits_data[0]['commit']['committer']['date']
         except urllib.error.HTTPError as e:
             if e.code == 409:
-                remote_sha = None # 空仓库
+                remote_sha = None 
             elif e.code == 404:
-                # 核心修复：捕获 404，拦截后续操作并返回给前端打开重建弹窗
                 return jsonify({"status": "not_found", "log": "❌ 智能检测：云端仓库已丢失(404)。"})
             else:
                 raise e
@@ -707,6 +770,7 @@ def api_sync_check():
         remote_time = datetime.strptime(remote_date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(tz_utc8)
 
         if local_sha == remote_sha:
+            update_last_sync(p_name)
             return jsonify({"status": "ok", "log": "🙌 本地与云端完全一致，无需同步。"})
 
         log_str = f"本地最后提交: {local_time.strftime('%m-%d %H:%M')} | 云端最后提交: {remote_time.strftime('%m-%d %H:%M')}"
@@ -714,13 +778,14 @@ def api_sync_check():
             return jsonify({"status": "need_pull", "msg": "云端有新的提交记录，是否拉取并覆盖本地？", "log": log_str})
         elif local_time > remote_time:
              return jsonify({"status": "need_push", "msg": "本地有未推送的历史提交，是否推送到云端？", "log": log_str})
+        
+        update_last_sync(p_name)
         return jsonify({"status": "ok", "log": log_str + "\\n两端一致。"})
     except Exception as e:
         return jsonify({"status": "error", "log": f"❌ 同步比对失败: {str(e)}"})
 
 @app.route('/api/recreate_push', methods=['POST'])
 def api_recreate_push():
-    """专用于处理本地有代码，但云端被删除了的恢复操作"""
     data = request.json
     name = data['name']
     is_private = data['is_private']
@@ -728,7 +793,6 @@ def api_recreate_push():
     target_path = os.path.join(BASE_DIR, name)
 
     try:
-        # 1. 重新在 GitHub 上建立空壳仓库
         api_url = "https://api.github.com/user/repos"
         payload = json.dumps({"name": name, "private": is_private}).encode()
         req = urllib.request.Request(api_url, data=payload, headers={"Authorization": f"token {token}"})
@@ -738,7 +802,6 @@ def api_recreate_push():
 
         auth_url = clone_url.replace("https://", f"https://{token}@")
         
-        # 2. 如果本地还有没暂存的，顺手打包一下
         default_committer = b"GitHubAutoTool <tool@localhost>"
         real_changes, deleted_files, _ = get_real_changes(target_path)
         if real_changes: porcelain.add(target_path, paths=real_changes)
@@ -746,7 +809,6 @@ def api_recreate_push():
         if real_changes or deleted_files:
             porcelain.commit(target_path, b"Automated Sync Commit Before Recreate", author=default_committer, committer=default_committer)
 
-        # 3. 将本地的全部内容强行原路推到刚建好的空壳里
         try:
             current_branch = porcelain.active_branch(target_path)
             refspec = b"refs/heads/" + current_branch + b":refs/heads/" + current_branch
@@ -755,10 +817,10 @@ def api_recreate_push():
 
         porcelain.push(target_path, auth_url, refspecs=[refspec])
 
-        # 4. 刷新本地数据库，标记为 Local+Cloud
+        now_str = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("UPDATE projects SET repo_url = ?, origin = 'Local+Cloud' WHERE name = ?", (clone_url, name))
+        c.execute("UPDATE projects SET repo_url = ?, origin = 'Local+Cloud', last_sync = ? WHERE name = ?", (clone_url, now_str, name))
         conn.commit()
         conn.close()
 
@@ -769,7 +831,8 @@ def api_recreate_push():
 @app.route('/api/push', methods=['POST'])
 def api_push():
     data = request.json
-    path = os.path.join(BASE_DIR, data['name'])
+    name = data['name']
+    path = os.path.join(BASE_DIR, name)
     auth_url = data['url'].replace("https://", f"https://{get_token()}@")
     default_committer = b"GitHubAutoTool <tool@localhost>"
     
@@ -788,6 +851,8 @@ def api_push():
             refspec = b"HEAD:refs/heads/main"
 
         porcelain.push(path, auth_url, refspecs=[refspec])
+        
+        update_last_sync(name)
         return jsonify({"log": "✅ 推送成功！云端已更新。"})
     except Exception as e:
         return jsonify({"log": f"❌ 推送失败: {str(e)}"})
@@ -795,10 +860,12 @@ def api_push():
 @app.route('/api/pull_update', methods=['POST'])
 def api_pull_update():
     data = request.json
-    path = os.path.join(BASE_DIR, data['name'])
+    name = data['name']
+    path = os.path.join(BASE_DIR, name)
     auth_url = data['url'].replace("https://", f"https://{get_token()}@")
     try:
         porcelain.pull(path, auth_url)
+        update_last_sync(name)
         return jsonify({"log": "✅ 拉取成功，本地已同步为云端最新代码。"})
     except Exception as e:
         return jsonify({"log": f"❌ 拉取更新失败: {str(e)}"})
@@ -809,10 +876,11 @@ def api_vscode():
     if not os.path.exists(path):
         return jsonify({"log": "❌ 启动失败：找不到本地项目文件夹。"})
     try:
+        # 使用精确的双引号路径注入，强制打开指定项目的目录工作区
         if os.name == 'nt':
-            subprocess.Popen("code .", cwd=path, shell=True)
+            subprocess.Popen(f'code "{path}"', shell=True)
         else:
-            subprocess.Popen(["code", "."], cwd=path)
+            subprocess.Popen(["code", path])
         return jsonify({"log": "✅ 已向系统发送调起 VS Code 的指令。"})
     except Exception as e:
         return jsonify({"log": f"❌ 启动 VS Code 失败: {str(e)}"})
@@ -870,9 +938,11 @@ def api_create():
         porcelain.commit(target_path, b"Initial commit", author=default_committer, committer=default_committer)
         porcelain.push(target_path, auth_url, refspecs=[b"HEAD:refs/heads/main"])
 
+        now_str = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT INTO projects (name, path, repo_url, origin) VALUES (?, ?, ?, ?)", (name, target_path, clone_url, "Local+Cloud"))
+        c.execute("INSERT INTO projects (name, path, repo_url, origin, last_sync) VALUES (?, ?, ?, ?, ?)", 
+                  (name, target_path, clone_url, "Local+Cloud", now_str))
         conn.commit()
         conn.close()
         return jsonify({"log": f"✅ 新项目 {name} 已在云端创建。"})
