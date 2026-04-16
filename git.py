@@ -573,7 +573,7 @@ HTML_TEMPLATE = """
                         showToast("推送成功"); 
                         await loadLocalRepos(); 
                         // [关键改动]：推送成功关闭模态框后，执行一次云端刷新
-                        await new Promise(resolve => setTimeout(resolve, 2000));
+                        await new Promise(resolve => setTimeout(resolve, 5000));
                         await fetchCloudRepos(); 
                     }
                 } else { log("已取消推送。"); }
