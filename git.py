@@ -16,21 +16,15 @@ from datetime import datetime, timezone, timedelta
 import tkinter as tk
 from tkinter import messagebox
 
-# ==========================================
-# 保证程序单例运行 (Mutex 锁，彻底杜绝多开)
-# ==========================================
 try:
     instance_lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    instance_lock.bind(('127.0.0.1', 58763)) # 用高位冷门端口作为唯一运行锁
+    instance_lock.bind(('127.0.0.1', 58763)) 
 except Exception:
     root = tk.Tk()
     root.withdraw()
     messagebox.showwarning("拦截提示", "程序已经在后台运行中了！\n请查看电脑右下角的系统托盘图标。")
     sys.exit(0)
 
-# ==========================================
-# 动态随机分配 Flask 端口
-# ==========================================
 def get_free_port():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(('127.0.0.1', 0))
@@ -40,11 +34,8 @@ def get_free_port():
 
 CURRENT_PORT = get_free_port()
 
-# ==========================================
-# 针对 v2rayN 的网络代理设置 (默认端口 10808)
 os.environ["http_proxy"] = "http://127.0.0.1:10808"
 os.environ["https_proxy"] = "http://127.0.0.1:10808"
-# ==========================================
 
 try:
     from flask import Flask, request, jsonify, render_template_string, Response
@@ -58,9 +49,6 @@ except ImportError:
     messagebox.showerror("缺少依赖", "请先在终端运行：\npip install -r requirements.txt")
     sys.exit()
 
-# ==========================================
-# 资源与数据库路径管理 (兼容 PyInstaller 打包)
-# ==========================================
 def get_resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
@@ -118,9 +106,6 @@ def update_last_sync(name):
 
 init_db()
 
-# ==========================================
-# 前端 HTML/CSS/JS (SSE 断线秒关版)
-# ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -216,9 +201,9 @@ HTML_TEMPLATE = """
     <div id="toast-container"></div>
     
     <div id="offline-overlay">
-        <div style="font-size: 50px; margin-bottom: 20px;">🔌</div>
-        <h2 style="margin:0; font-size: 28px;">服务端已断开连接</h2>
-        <p style="color: #94a3b8; margin-top: 15px;">后台守护进程已退出，正在自动关闭窗口...</p>
+        <div style="font-size: 50px; margin-bottom: 20px;" id="offline-icon">🔌</div>
+        <h2 style="margin:0; font-size: 28px;" id="offline-title">服务端已断开连接</h2>
+        <p style="color: #94a3b8; margin-top: 15px;" id="offline-desc">安全自毁程序启动，正在关闭窗口...</p>
     </div>
 
     <div id="custom-alert-modal" class="modal">
@@ -405,7 +390,6 @@ HTML_TEMPLATE = """
             }
         }
 
-        // ================= 核心：SSE 毫秒级断线自毁机制 =================
         const evtSource = new EventSource('/api/stream');
         evtSource.onerror = function() {
             document.getElementById('offline-overlay').style.display = 'flex';
@@ -414,7 +398,6 @@ HTML_TEMPLATE = """
             }, 100);
         };
 
-        // ================= 极速后台无感刷新本地状态 =================
         async function silentRefreshLocal() {
             try {
                 const res = await fetch('/api/local_repos');
@@ -681,9 +664,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# ==========================================
-# 后端 Flask 服务器
-# ==========================================
 app = Flask(__name__)
 
 def is_v2rayn_running():
@@ -964,13 +944,15 @@ def api_push():
 
         porcelain.push(path, auth_url, refspecs=[refspec])
         
+        pull_msg = ""
         try:
             porcelain.pull(path, auth_url)
-        except Exception:
-            pass
+            pull_msg = "并已自动拉取同步最新状态。"
+        except Exception as pull_e:
+            pull_msg = f"但自动拉取遇到问题: {str(pull_e)}"
 
         update_last_sync(name)
-        return jsonify({"log": "✅ 推送成功！并已自动拉取同步最新状态。"})
+        return jsonify({"log": f"✅ 推送成功！{pull_msg}"})
     except Exception as e:
         return jsonify({"log": f"❌ 推送失败: {str(e)}"})
 
@@ -1073,12 +1055,7 @@ def api_create():
     except Exception as e:
         return jsonify({"log": f"❌ 新建项目失败: {str(e)}"})
 
-
-# ==========================================
-# 系统托盘与图标管理
-# ==========================================
 def get_tray_icon():
-    """读取用户自定义的托盘图标 app_icon.png，没有则兜底"""
     png_path = get_resource_path("app_icon.png")
     if os.path.exists(png_path):
         return Image.open(png_path)
@@ -1089,12 +1066,10 @@ def get_tray_icon():
     return img
 
 def set_tkinter_icon(root):
-    """自动从 GitHub 官方抓取原汁原味的图标赋予 Tkinter (Tkinter不认SVG)"""
     try:
         icon_path = get_resource_path("github_icon.png")
         if not os.path.exists(icon_path):
             req = urllib.request.Request("https://github.githubassets.com/favicons/favicon.png", headers={'User-Agent': 'Mozilla/5.0'})
-            # 屏蔽证书校验，防止部分电脑因为内置根证书过期导致下载失败
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -1105,7 +1080,7 @@ def set_tkinter_icon(root):
         img = Image.open(icon_path)
         photo = ImageTk.PhotoImage(img)
         root.iconphoto(True, photo)
-        root._window_icon = photo # 保持引用，防止被 Python 垃圾回收销毁
+        root._window_icon = photo 
     except Exception:
         pass
 
@@ -1125,9 +1100,6 @@ def exit_app():
         systray_icon.stop()
     os._exit(0)
 
-# ==========================================
-# 极简启动器 (托盘后台守护)
-# ==========================================
 class LauncherApp:
     def __init__(self, root):
         self.root = root
@@ -1135,10 +1107,8 @@ class LauncherApp:
         self.root.geometry("400x150")
         self.root.eval('tk::PlaceWindow . center')
         
-        # 换成你想要的纯正 GitHub 图标
         set_tkinter_icon(self.root)
         
-        # 拦截右上角 X 号，改为隐藏到托盘
         self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
         
         tk.Label(root, text="Personal Access Token:", font=("Arial", 10, "bold")).pack(pady=(15, 5))
@@ -1164,12 +1134,11 @@ class LauncherApp:
         
         self.start_btn.config(text="🌐 后台守护运行中...", bg="#64748b", state=tk.DISABLED)
         
-        # 启动后台服务与托盘图标
         threading.Thread(target=lambda: app.run(port=CURRENT_PORT, use_reloader=False), daemon=True).start()
         threading.Thread(target=create_systray, daemon=True).start()
         
         webbrowser.open(f"http://127.0.0.1:{CURRENT_PORT}")
-        self.root.withdraw() # 隐藏主窗口
+        self.root.withdraw() 
 
 if __name__ == "__main__":
     import logging
