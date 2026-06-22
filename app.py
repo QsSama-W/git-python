@@ -13,17 +13,13 @@ import time
 import socket
 import ssl
 from datetime import datetime, timezone, timedelta
-import tkinter as tk
-from tkinter import messagebox
 
 # 实例检测：防止程序重复启动
 try:
     instance_lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     instance_lock.bind(('127.0.0.1', 58763)) 
 except Exception:
-    root = tk.Tk()
-    root.withdraw()
-    messagebox.showwarning("拦截提示", "程序已经在后台运行中了！\n请查看电脑右下角的系统托盘图标。")
+    print("程序已经在后台运行中了！请查看系统托盘图标。")
     sys.exit(0)
 
 def get_free_port():
@@ -44,11 +40,9 @@ try:
     from dulwich import porcelain
     from dulwich.repo import Repo
     import pystray
-    from PIL import Image, ImageDraw, ImageTk
+    from PIL import Image, ImageDraw
 except ImportError:
-    root = tk.Tk()
-    root.withdraw()
-    messagebox.showerror("缺少依赖", "请先在终端运行：\npip install flask dulwich pystray pillow")
+    print("缺少依赖！请先在终端运行：pip install flask dulwich pystray pillow")
     sys.exit()
 
 def get_resource_path(relative_path):
@@ -58,9 +52,11 @@ def get_resource_path(relative_path):
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "manager_data.db")
-IGNORE_PATTERNS = ('.db', '.log', '.sqlite', '.sqlite3', '.pyc')
-IGNORE_NAMES = ('manager_data.db', '__pycache__')
-IGNORE_DIRS = {'.git', 'node_modules', 'venv', '.venv', '__pycache__'}
+
+# 【核心修正】加入大量常见的 IDE、系统缓存、构建包目录，防止底层时间遍历时的幽灵误报
+IGNORE_PATTERNS = ('.db', '.log', '.sqlite', '.sqlite3', '.pyc', '.DS_Store', '.suo', '.user', '.pyo', '.pyd')
+IGNORE_NAMES = ('manager_data.db', '__pycache__', '.DS_Store')
+IGNORE_DIRS = {'.git', 'node_modules', 'venv', '.venv', '__pycache__', '.vscode', '.idea', '.cursor', '.github', 'dist', 'build', 'out', 'target'}
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -75,6 +71,10 @@ def init_db():
     columns = [info[1] for info in cursor.fetchall()]
     if 'last_sync' not in columns:
         cursor.execute("ALTER TABLE projects ADD COLUMN last_sync TEXT DEFAULT '缺省'")
+    cursor.execute("PRAGMA table_info(settings)")
+    setting_columns = [info[1] for info in cursor.fetchall()]
+    if 'v2ray_path' not in setting_columns:
+        cursor.execute("ALTER TABLE settings ADD COLUMN v2ray_path TEXT DEFAULT ''")
 
     cursor.execute("SELECT COUNT(*) FROM settings")
     if cursor.fetchone()[0] == 0:
@@ -96,6 +96,40 @@ def save_token(token):
     cursor.execute("UPDATE settings SET token = ? WHERE id = 1", (token,))
     conn.commit()
     conn.close()
+
+def get_v2ray_path():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT v2ray_path FROM settings WHERE id = 1")
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else ""
+
+def save_v2ray_path(path):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE settings SET v2ray_path = ? WHERE id = 1", (path,))
+    conn.commit()
+    conn.close()
+
+def start_v2rayn():
+    v2ray_path = get_v2ray_path()
+    if not v2ray_path:
+        return {"status": "error", "msg": "未配置 V2rayN 启动路径"}
+    if not os.path.exists(v2ray_path):
+        return {"status": "error", "msg": f"路径不存在: {v2ray_path}"}
+    try:
+        if os.name == 'nt':
+            subprocess.Popen(f'start "" "{v2ray_path}"', shell=True)
+        else:
+            subprocess.Popen([v2ray_path])
+        time.sleep(2)
+        if is_v2rayn_running():
+            return {"status": "success", "msg": "V2rayN 启动成功"}
+        else:
+            return {"status": "error", "msg": "启动命令已执行，但V2rayN进程未检测到"}
+    except Exception as e:
+        return {"status": "error", "msg": f"启动失败: {str(e)}"}
 
 def update_last_sync(name):
     conn = sqlite3.connect(DB_PATH)
@@ -162,7 +196,7 @@ HTML_TEMPLATE = """
         .badge { font-size: 11px; padding: 3px 8px; border-radius: 12px; background: #e2e8f0; color: #475569; font-weight: 500;}
 
         button { padding: 8px 12px; border: none; border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; transition: all 0.2s; color: white;}
-        button:disabled { opacity: 0.6; cursor: not-allowed; }
+        button:disabled { opacity: 0.6; cursor: not-allowed; filter: grayscale(50%); }
         button:active:not(:disabled) { transform: translateY(1px); }
         .btn-primary { background: var(--primary); } .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
         .btn-success { background: var(--success); } .btn-success:hover:not(:disabled) { background: var(--success-hover); }
@@ -209,7 +243,7 @@ HTML_TEMPLATE = """
         <p style="color: #94a3b8; margin-top: 15px;" id="offline-desc">安全自毁程序启动，正在关闭窗口...</p>
     </div>
 
-    <div id="custom-alert-modal" class="modal">
+    <div id="custom-alert-modal" class="modal" style="z-index: 200;">
         <div class="modal-content" style="width: 320px;">
             <h3 id="alert-title">提示</h3>
             <p id="alert-msg"></p>
@@ -219,10 +253,10 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <div id="custom-confirm-modal" class="modal">
+    <div id="custom-confirm-modal" class="modal" style="z-index: 200;">
         <div class="modal-content" style="width: 340px;">
             <h3 id="confirm-title">需要确认</h3>
-            <p id="confirm-msg"></p>
+            <p id="confirm-msg" style="white-space: pre-wrap;"></p>
             <div class="modal-actions">
                 <button class="btn-success" id="btn-confirm-yes" style="flex: 1;">确认 (Y)</button>
                 <button class="btn-danger" id="btn-confirm-no" style="flex: 1;">取消 (N)</button>
@@ -232,8 +266,8 @@ HTML_TEMPLATE = """
 
     <div id="recreate-modal" class="modal">
         <div class="modal-content" style="width: 360px;">
-            <h3>⚠️ 云端仓库丢失</h3>
-            <p style="color: #ef4444; font-weight: 600; margin-bottom: 8px;">检测到该项目在 GitHub 云端已被删除或不存在。</p>
+            <h3>⚠️ 云端仓库未找到</h3>
+            <p style="color: #ef4444; font-weight: 600; margin-bottom: 8px;">云端未找到该项目，可能已被删除或尚未上传云端。</p>
             <p style="margin-top: 0;">是否使用本地现有代码在云端重新创建该仓库，并推送所有历史记录？</p>
             <div class="input-group" style="margin-bottom: 15px;">
                 <label style="display:flex; align-items:center; gap:8px; cursor:pointer; color:#475569; font-size:13px;">
@@ -249,6 +283,40 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+    <div id="settings-modal" class="modal">
+        <div class="modal-content" style="width: 450px;">
+            <h3>⚙️ 系统设置</h3>
+            <div class="input-group">
+                <label style="font-size: 13px; font-weight: 600; color:#334155;">GitHub Personal Access Token</label>
+                <p style="font-size: 12px; color: #64748b; margin: 4px 0 8px 0;">用于访问 GitHub API，需具备 repo 权限</p>
+                <input type="text" id="github-token-input" placeholder="ghp_xxxxxxxxxxxx" />
+                <div style="margin-top: 10px; display: flex; gap: 10px;">
+                    <button class="btn-success btn-sm" id="btn-save-token" onclick="saveGitHubToken()">
+                        <div class="spinner"></div><span>保存 Token</span>
+                    </button>
+                    <button class="btn-info btn-sm" onclick="testGitHubToken()">测试连接</button>
+                </div>
+            </div>
+            <div class="input-group">
+                <label style="font-size: 13px; font-weight: 600; color:#334155;">V2rayN 启动路径</label>
+                <p style="font-size: 12px; color: #64748b; margin: 4px 0 8px 0;">配置 V2rayN.exe 的完整路径，当代理未启动时可自动拉起</p>
+                <input type="text" id="v2ray-path-input" placeholder="例如：C:\\Program Files\\v2rayN\\v2rayN.exe" />
+                <div style="margin-top: 10px; display: flex; gap: 10px;">
+                    <button class="btn-success btn-sm" id="btn-save-v2ray-path" onclick="saveV2rayPath()">
+                        <div class="spinner"></div><span>保存路径</span>
+                    </button>
+                    <button class="btn-info btn-sm" id="btn-start-v2rayn" onclick="startV2rayN()">
+                        <div class="spinner"></div><span>启动 V2rayN</span>
+                    </button>
+                    <button class="btn-secondary btn-sm" onclick="testV2rayPath()">测试路径</button>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn-primary" style="width: 100%;" onclick="closeSettingsModal()">完成</button>
+            </div>
+        </div>
+    </div>
+
     <div class="container">
         <div class="header">
             <h1>🚀 GitHub 极客工作台</h1>
@@ -257,6 +325,7 @@ HTML_TEMPLATE = """
                     <div class="spinner"></div><span>☁️ 刷新云端</span>
                 </button>
                 <button class="btn-warning" onclick="showCreateModal()">➕ 新建上云</button>
+                <button class="btn-secondary" onclick="showSettingsModal()">⚙️ 设置</button>
             </div>
         </div>
 
@@ -310,6 +379,19 @@ HTML_TEMPLATE = """
         let repoToRecreate = null;
         let selectedLocalIndex = -1;
         let selectedCloudIndex = -1;
+
+        const CLOUD_TOLERANCE_MS = 60000; 
+        const LOCAL_TOLERANCE_MS = 2000; 
+        
+        const shaCheckCache = {};
+
+        // 【核心修正】强制时区对齐，防止因系统时区不同导致几小时的巨型误报
+        function parseUTC8Time(timeStr) {
+            if (!timeStr || timeStr === '缺省') return 0;
+            // 将 "YYYY-MM-DD HH:MM:SS" 强转为 ISO 8601 并追加 +08:00
+            const isoStr = timeStr.replace(' ', 'T') + '+08:00'; 
+            return new Date(isoStr).getTime();
+        }
 
         function customAlert(msg, title="提示") {
             return new Promise(resolve => {
@@ -382,6 +464,100 @@ HTML_TEMPLATE = """
             return `${y}-${m}-${day} ${h}:${min}`;
         }
 
+        function applyShaStatus(status, idx) {
+            const vsCodeBtn = document.getElementById(`btn-vscode-${idx}`);
+            const folderBtn = document.getElementById(`btn-folder-${idx}`);
+            const extraDiv = document.getElementById(`meta-extra-${idx}`);
+            if (!extraDiv) return;
+
+            if (status === 'same') {
+                extraDiv.innerHTML = '<span style="color: #10b981; font-weight: bold; display: block; margin-top: 5px;">✅ 已经是最新状态</span>';
+                if (vsCodeBtn) vsCodeBtn.disabled = false;
+                if (folderBtn) folderBtn.disabled = false;
+            } else if (status === 'cloud_newer') {
+                extraDiv.innerHTML = '<span style="color: #ef4444; font-weight: bold; display: block; margin-top: 5px;">⚠️ 本地信息已不是最新版本，请同步云端数据</span>';
+                if (vsCodeBtn) vsCodeBtn.disabled = true;
+                if (folderBtn) folderBtn.disabled = true;
+            } else if (status === 'local_newer') {
+                extraDiv.innerHTML = '<span style="color: #10b981; font-weight: bold; display: block; margin-top: 5px;">💡 本地版本较新，建议推送到云端</span>';
+                if (vsCodeBtn) vsCodeBtn.disabled = false;
+                if (folderBtn) folderBtn.disabled = false;
+            }
+        }
+
+        // 【核心修正】更加完善的状态核对中心，防止“空保存穿透”
+        async function updateRepoStatuses() {
+            for (let i = 0; i < localRepos.length; i++) {
+                const r = localRepos[i];
+                const cloudRepo = cloudRepos.find(c => c.name === r.name);
+                const extraDiv = document.getElementById(`meta-extra-${i}`);
+
+                if (extraDiv) extraDiv.innerHTML = '';
+
+                if (cloudRepo && r.local_mtime !== '缺省') {
+                    const localTime = parseUTC8Time(r.local_mtime);
+                    const syncTime = parseUTC8Time(r.last_sync);
+                    
+                    // 修复 Github 假更新：使用 pushed_at (真实代码提交时间) 替代 updated_at (Star/Issue 时间)
+                    const cloudTimeStr = cloudRepo.pushed_at || cloudRepo.updated_at;
+                    const cloudTime = new Date(cloudTimeStr).getTime();
+
+                    let determinedStatus = null;
+                    let needsShaCheck = false; // 是否需要进行精确防误报核验
+
+                    if (syncTime > 0) {
+                        if (cloudTime > syncTime + CLOUD_TOLERANCE_MS || localTime > syncTime + LOCAL_TOLERANCE_MS) {
+                            // 时间超出了上次同步锚点，可能有人写了代码，也可能是空保存。交给后台精确查验。
+                            needsShaCheck = true;
+                        } else {
+                            // 一切都在锚点内，绝对是没碰过的
+                            determinedStatus = 'same';
+                        }
+                    } else {
+                        // 首次运行或无锚点记录，强行核对一次
+                        needsShaCheck = true;
+                    }
+
+                    if (needsShaCheck) {
+                        // 利用 mtime 作为缓存锁，mtime不变更就不会重复耗费 API 请求
+                        const cacheKey = `${r.name}_${r.local_mtime}_${cloudTimeStr}`;
+                        if (shaCheckCache[cacheKey]) {
+                            if (shaCheckCache[cacheKey] !== 'pending') {
+                                applyShaStatus(shaCheckCache[cacheKey], i);
+                            }
+                        } else {
+                            shaCheckCache[cacheKey] = 'pending';
+                            if (extraDiv) extraDiv.innerHTML = '<span style="color: #64748b; font-size: 11px; display: block; margin-top: 5px;">🔄 正在精准比对...</span>';
+                            try {
+                                const res = await fetch('/api/sha_compare', {
+                                    method: 'POST',
+                                    headers: {'Content-Type': 'application/json'},
+                                    body: JSON.stringify({name: r.name, url: r.repo_url})
+                                });
+                                const data = await res.json();
+                                if (data.status && data.status !== 'error') {
+                                    shaCheckCache[cacheKey] = data.status;
+                                    applyShaStatus(data.status, i);
+                                } else {
+                                    delete shaCheckCache[cacheKey];
+                                    if (extraDiv) extraDiv.innerHTML = '';
+                                }
+                            } catch(e) {
+                                delete shaCheckCache[cacheKey];
+                                if (extraDiv) extraDiv.innerHTML = '';
+                            }
+                        }
+                    } else {
+                        applyShaStatus(determinedStatus, i);
+                    }
+                } else if (!cloudRepo) {
+                    if (extraDiv) {
+                        extraDiv.innerHTML = '<span style="color: #f59e0b; font-weight: bold; display: block; margin-top: 5px;">⚠️ 云端未找到该项目，可能已被删除或未上云</span>';
+                    }
+                }
+            }
+        }
+
         async function apiCall(endpoint, method='POST', body=null) {
             try {
                 const options = { method: method, headers: {'Content-Type': 'application/json'} };
@@ -443,6 +619,7 @@ HTML_TEMPLATE = """
                                 syncSpan.innerHTML = `🔄 <b>最后同步:</b> ${r.last_sync}`;
                             }
                         });
+                        await updateRepoStatuses();
                     }
                 }
             } catch(e) {}
@@ -452,7 +629,19 @@ HTML_TEMPLATE = """
         async function checkInitInfo() {
             const res = await apiCall('/api/init_info', 'GET');
             if(res && res.v2rayN_running === false) {
-                await customAlert("检测到后台 V2rayN 代理程序未运行！\\n\\n由于系统已配置强制通过 10808 端口代理，若没有对应的代理软件接收流量，获取云端数据可能会一直卡死或报错超时。\\n请检查并启动 V2rayN。", "⚠️ 代理未运行警告");
+                if (res.v2ray_path) {
+                    const shouldStart = await customConfirm("检测到后台 V2rayN 代理程序未运行！\\n\\n由于系统已配置强制通过 10808 端口代理，若没有对应的代理软件接收流量，获取云端数据可能会一直卡死或报错超时。\\n\\n是否自动启动 V2rayN？", "⚠️ 代理未运行警告");
+                    if (shouldStart) {
+                        const startRes = await apiCall('/api/start_v2rayn', 'POST');
+                        if (startRes.status === 'success') {
+                            showToast("V2rayN 已启动", "success");
+                        } else {
+                            showToast(startRes.msg || "启动失败", "error");
+                        }
+                    }
+                } else {
+                    await customAlert("检测到后台 V2rayN 代理程序未运行！\\n\\n由于系统已配置强制通过 10808 端口代理，若没有对应的代理软件接收流量，获取云端数据可能会一直卡死或报错超时。\\n\\n请前往「设置」配置 V2rayN 启动路径，或手动启动 V2rayN。", "⚠️ 代理未运行警告");
+                }
             }
         }
 
@@ -474,10 +663,12 @@ HTML_TEMPLATE = """
                         <div class="item-meta">
                             <span id="mtime-${idx}">🕒 <b>最后修改:</b> ${r.local_mtime}</span>
                             <span id="sync-${idx}">🔄 <b>最后同步:</b> ${r.last_sync}</span>
+                            <div id="meta-extra-${idx}" style="flex-basis: 100%;"></div>
                         </div>
                         <div class="item-actions">
                             <button id="btn-sync-${idx}" class="btn-success btn-sm" onclick="syncProject(${idx}, event)"><div class="spinner"></div><span>智能比对同步</span></button>
-                            <button id="btn-vscode-${idx}" class="btn-info btn-sm" onclick="openVsCode(${idx}, event)"><div class="spinner"></div><span>VS Code / 文件夹</span></button>
+                            <button id="btn-vscode-${idx}" class="btn-info btn-sm" onclick="openVsCode(${idx}, event)"><div class="spinner"></div><span>VS Code</span></button>
+                            <button id="btn-folder-${idx}" class="btn-secondary btn-sm" onclick="openFolder(${idx}, event)"><div class="spinner"></div><span>文件夹</span></button>
                             <button id="btn-del-${idx}" class="btn-danger btn-sm btn-right" onclick="deleteLocal(${idx}, event)"><div class="spinner"></div><span>彻底删除</span></button>
                         </div>
                     `;
@@ -489,6 +680,7 @@ HTML_TEMPLATE = """
                     };
                     container.appendChild(div);
                 });
+                await updateRepoStatuses();
             } else {
                 container.innerHTML = '<div style="padding:20px; text-align:center; color:#94a3b8; font-size:13px;">暂无本地项目</div>';
             }
@@ -515,7 +707,7 @@ HTML_TEMPLATE = """
                                 ${r.private ? '<span class="badge" style="background:#fef08a;color:#854d0e;">私有</span>' : ''}
                             </div>
                             <div class="item-meta">
-                                <span>🕒 <b>云端最后修改:</b> ${formatGithubTime(r.updated_at)}</span>
+                                <span>🕒 <b>云端最后修改:</b> ${formatGithubTime(r.pushed_at || r.updated_at)}</span>
                             </div>
                             <div class="item-actions">
                                 <button id="btn-pull-${idx}" class="btn-primary btn-sm" onclick="pullProject(${idx}, event)"><div class="spinner"></div><span>⬇️ 拉取到本地</span></button>
@@ -532,6 +724,7 @@ HTML_TEMPLATE = """
                     });
                 }
                 showToast("云端列表已刷新");
+                await updateRepoStatuses();
             } else {
                 container.innerHTML = '<div style="padding:20px; text-align:center; color:#ef4444; font-size:13px;">获取失败，请检查 Token</div>';
                 showToast("获取云端列表失败", "error");
@@ -572,7 +765,6 @@ HTML_TEMPLATE = """
                     if(p.log && p.log.includes('✅')) { 
                         showToast("推送成功"); 
                         await loadLocalRepos(); 
-                        // [关键改动]：推送成功关闭模态框后，执行一次云端刷新
                         await new Promise(resolve => setTimeout(resolve, 5000));
                         await fetchCloudRepos(); 
                     }
@@ -602,6 +794,15 @@ HTML_TEMPLATE = """
             setLoading(btnId, false);
         }
 
+        async function openFolder(idx, event) {
+            if(event) event.stopPropagation();
+            const btnId = `btn-folder-${idx}`;
+            setLoading(btnId, true);
+            const repo = localRepos[idx];
+            await apiCall('/api/open_folder', 'POST', {name: repo.name});
+            setLoading(btnId, false);
+        }
+
         function openBrowser(idx, event) {
             if(event) event.stopPropagation();
             const repo = cloudRepos[idx];
@@ -624,6 +825,99 @@ HTML_TEMPLATE = """
         function closeRecreateModal() {
             document.getElementById('recreate-modal').style.display = 'none';
             repoToRecreate = null;
+        }
+
+        function showSettingsModal() {
+            document.getElementById('settings-modal').style.display = 'flex';
+            loadGitHubToken();
+            loadV2rayPath();
+        }
+
+        function closeSettingsModal() {
+            document.getElementById('settings-modal').style.display = 'none';
+        }
+
+        async function loadGitHubToken() {
+            const res = await apiCall('/api/github_token', 'GET');
+            if (res && res.masked !== undefined) {
+                document.getElementById('github-token-input').placeholder = res.masked || 'ghp_xxxxxxxxxxxx';
+                document.getElementById('github-token-input').value = '';
+            }
+        }
+
+        async function saveGitHubToken() {
+            const token = document.getElementById('github-token-input').value.trim();
+            if (!token) {
+                await customAlert("请输入 Token", "提示");
+                return;
+            }
+            setLoading('btn-save-token', true);
+            const res = await apiCall('/api/github_token', 'POST', {token: token});
+            if (res.status === 'success') {
+                showToast("Token 已保存", "success");
+                loadGitHubToken();
+            } else {
+                showToast(res.msg || "保存失败", "error");
+            }
+            setLoading('btn-save-token', false);
+        }
+
+        async function testGitHubToken() {
+            const token = document.getElementById('github-token-input').value.trim();
+            if (!token) {
+                await customAlert("请输入要测试的 Token", "提示");
+                return;
+            }
+            const res = await apiCall('/api/test_github_token', 'POST', {token: token});
+            if (res.status === 'success') {
+                await customAlert(res.msg, "测试成功");
+            } else {
+                await customAlert(res.msg || "测试失败", "测试失败");
+            }
+        }
+
+        async function loadV2rayPath() {
+            const res = await apiCall('/api/v2ray_path', 'GET');
+            if (res && res.path !== undefined) {
+                document.getElementById('v2ray-path-input').value = res.path;
+            }
+        }
+
+        async function saveV2rayPath() {
+            const path = document.getElementById('v2ray-path-input').value.trim();
+            setLoading('btn-save-v2ray-path', true);
+            const res = await apiCall('/api/v2ray_path', 'POST', {path: path});
+            if (res.status === 'success') {
+                showToast("路径已保存", "success");
+            } else {
+                showToast(res.msg || "保存失败", "error");
+            }
+            setLoading('btn-save-v2ray-path', false);
+        }
+
+        async function startV2rayN() {
+            setLoading('btn-start-v2rayn', true);
+            const res = await apiCall('/api/start_v2rayn', 'POST');
+            if (res.status === 'success') {
+                showToast("V2rayN 启动成功", "success");
+            } else {
+                showToast(res.msg || "启动失败", "error");
+            }
+            setLoading('btn-start-v2rayn', false);
+        }
+
+        async function testV2rayPath() {
+            const path = document.getElementById('v2ray-path-input').value.trim();
+            if (!path) {
+                await customAlert("请先输入路径", "提示");
+                return;
+            }
+            const res = await apiCall('/api/test_v2ray_path', 'POST', {path: path});
+            if (res.status === 'success') {
+                await customAlert("路径有效！", "测试成功");
+            } else {
+                await customAlert(res.msg || "路径无效", "测试失败");
+            }
         }
 
         async function submitRecreate() {
@@ -735,6 +1029,7 @@ def get_project_mtime(p_path):
     try:
         repo = Repo(p_path)
         commit_ts = repo[repo.head()].commit_time
+        repo.close()
     except Exception:
         pass
     
@@ -764,7 +1059,70 @@ def api_ping():
 
 @app.route('/api/init_info', methods=['GET'])
 def api_init_info():
-    return jsonify({"v2rayN_running": is_v2rayn_running()})
+    return jsonify({"v2rayN_running": is_v2rayn_running(), "v2ray_path": get_v2ray_path()})
+
+@app.route('/api/github_token', methods=['GET', 'POST'])
+def api_github_token():
+    if request.method == 'GET':
+        token = get_token()
+        masked = token[:4] + '****' + token[-4:] if len(token) > 8 else token
+        return jsonify({"token": token, "masked": masked})
+    else:
+        data = request.json
+        token = data.get('token', '').strip()
+        save_token(token)
+        return jsonify({"status": "success", "msg": "Token 已保存"})
+
+@app.route('/api/test_github_token', methods=['POST'])
+def api_test_github_token():
+    data = request.json
+    token = data.get('token', '').strip()
+    if not token:
+        return jsonify({"status": "error", "msg": "Token 不能为空"})
+    try:
+        url = "https://api.github.com/user"
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json"
+        })
+        with urllib.request.urlopen(req) as res:
+            user_data = json.loads(res.read().decode())
+            return jsonify({"status": "success", "msg": f"连接成功！用户: {user_data.get('login', 'unknown')}"})
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return jsonify({"status": "error", "msg": "Token 无效或已过期"})
+        return jsonify({"status": "error", "msg": f"请求失败: HTTP {e.code}"})
+    except Exception as e:
+        return jsonify({"status": "error", "msg": f"连接失败: {str(e)}"})
+
+@app.route('/api/v2ray_path', methods=['GET', 'POST'])
+def api_v2ray_path():
+    if request.method == 'GET':
+        return jsonify({"path": get_v2ray_path()})
+    else:
+        data = request.json
+        path = data.get('path', '').strip()
+        save_v2ray_path(path)
+        return jsonify({"status": "success", "msg": "路径已保存"})
+
+@app.route('/api/start_v2rayn', methods=['POST'])
+def api_start_v2rayn():
+    result = start_v2rayn()
+    return jsonify(result)
+
+@app.route('/api/test_v2ray_path', methods=['POST'])
+def api_test_v2ray_path():
+    data = request.json
+    path = data.get('path', '').strip()
+    if not path:
+        return jsonify({"status": "error", "msg": "路径不能为空"})
+    if os.path.exists(path):
+        if path.lower().endswith('.exe'):
+            return jsonify({"status": "success", "msg": "路径有效"})
+        else:
+            return jsonify({"status": "error", "msg": "文件不是 .exe 格式"})
+    else:
+        return jsonify({"status": "error", "msg": "路径不存在"})
 
 @app.route('/api/local_repos', methods=['GET'])
 def api_local_repos():
@@ -809,6 +1167,55 @@ def api_fetch_cloud():
             return jsonify({"status": "success", "repos": repos, "log": f"✅ 成功加载了 {len(repos)} 个云端项目。"})
     except Exception as e:
         return jsonify({"status": "error", "log": f"❌ 获取云端失败: {str(e)}"})
+
+@app.route('/api/sha_compare', methods=['POST'])
+def api_sha_compare():
+    data = request.json
+    p_name = data['name']
+    p_url = data['url']
+    p_path = os.path.join(BASE_DIR, p_name)
+    token = get_token()
+
+    try:
+        real_changes, deleted_files, staged_files = get_real_changes(p_path)
+        if real_changes or deleted_files or staged_files:
+            return jsonify({"status": "local_newer"})
+
+        ts = int(time.time() * 1000)
+        if "github.com" not in p_url:
+            return jsonify({"status": "error"})
+            
+        api_url = f"https://api.github.com/repos/{p_url.split('github.com/')[-1].replace('.git','')}/commits?per_page=1&t={ts}"
+        req = urllib.request.Request(api_url, headers={"Authorization": f"token {token}", "Cache-Control": "no-cache"})
+        
+        try:
+            with urllib.request.urlopen(req) as res:
+                commits_data = json.loads(res.read().decode())
+                remote_sha = commits_data[0]['sha'] if commits_data else None
+                if commits_data:
+                    remote_date_str = commits_data[0]['commit']['committer']['date']
+        except urllib.error.HTTPError:
+            return jsonify({"status": "error"})
+
+        if not remote_sha:
+            return jsonify({"status": "same"})
+
+        tz_utc8 = timezone(timedelta(hours=8))
+        r = Repo(p_path)
+        local_sha = r.head().decode('utf-8')
+        local_time = datetime.fromtimestamp(r[local_sha.encode()].commit_time, tz=timezone.utc).astimezone(tz_utc8)
+        r.close()
+        remote_time = datetime.strptime(remote_date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(tz_utc8)
+
+        if local_sha == remote_sha:
+            return jsonify({"status": "same"})
+        else:
+            if remote_time > local_time:
+                return jsonify({"status": "cloud_newer"})
+            else:
+                return jsonify({"status": "local_newer"})
+    except Exception:
+        return jsonify({"status": "error"})
 
 @app.route('/api/pull', methods=['POST'])
 def api_pull():
@@ -859,18 +1266,19 @@ def api_sync_check():
             if e.code == 409:
                 remote_sha = None 
             elif e.code == 404:
-                return jsonify({"status": "not_found", "log": "❌ 智能检测：云端仓库已丢失(404)。"})
+                return jsonify({"status": "not_found", "log": "❌ 智能检测：云端未找到该项目，可能已被删除或未上传云端。"})
             else:
                 raise e
 
         real_changes, deleted_files, staged_files = get_real_changes(p_path)
         if real_changes or deleted_files or staged_files:
-            return jsonify({"status": "need_push", "msg": "检测到本地代码有未暂存修改，是否打包推送到云端？", "log": "⚡ 发现本地未提交的修改。"})
+            return jsonify({"status": "need_push", "msg": "检测到本地代码有未暂存的修改，是否将本地代码推送到云端？", "log": "⚡ 发现本地未提交的修改。"})
 
         tz_utc8 = timezone(timedelta(hours=8))
         r = Repo(p_path)
         local_sha = r.head().decode('utf-8')
         local_time = datetime.fromtimestamp(r[local_sha.encode()].commit_time, tz=timezone.utc).astimezone(tz_utc8)
+        r.close()
 
         if not remote_sha:
             return jsonify({"status": "ok", "log": "云端仓库为空，等待推送。"})
@@ -882,10 +1290,19 @@ def api_sync_check():
             return jsonify({"status": "ok", "log": "🙌 本地与云端完全一致，无需同步。"})
 
         log_str = f"本地最后提交: {local_time.strftime('%m-%d %H:%M')} | 云端最后提交: {remote_time.strftime('%m-%d %H:%M')}"
+        
         if remote_time > local_time:
-            return jsonify({"status": "need_pull", "msg": "云端有新的提交记录，是否拉取并覆盖本地？", "log": log_str})
+            return jsonify({
+                "status": "need_pull", 
+                "msg": "检测到云端最后修改时间较新！\n即将从云端拉取最新数据并覆盖本地数据，是否确认执行？", 
+                "log": f"{log_str}\n⚠️ 云端数据较新，需要覆盖本地。"
+            })
         elif local_time > remote_time:
-             return jsonify({"status": "need_push", "msg": "本地有未推送的历史提交，是否推送到云端？", "log": log_str})
+             return jsonify({
+                 "status": "need_push", 
+                 "msg": "检测到本地修改时间较新！\n是否将本地最新代码推送到云端？", 
+                 "log": f"{log_str}\n💡 本地数据较新，建议推送。"
+             })
         
         update_last_sync(p_name)
         return jsonify({"status": "ok", "log": log_str + "\\n两端一致。"})
@@ -995,28 +1412,49 @@ def api_vscode():
             subprocess.Popen(f'code "{path}"', shell=True)
         else:
             subprocess.Popen(["code", path])
-            
+        return jsonify({"log": "✅ 已启动 VS Code。"})
+    except Exception as e:
+        return jsonify({"log": f"❌ 启动失败: {str(e)}"})
+
+@app.route('/api/open_folder', methods=['POST'])
+def api_open_folder():
+    path = os.path.join(BASE_DIR, request.json['name'])
+    if not os.path.exists(path):
+        return jsonify({"log": "❌ 打开失败：找不到本地项目文件夹。"})
+    try:
         if sys.platform == 'win32':
             os.startfile(path)
         elif sys.platform == 'darwin':
             subprocess.Popen(["open", path])
         else:
             subprocess.Popen(["xdg-open", path])
-            
-        return jsonify({"log": "✅ 已同时调起 VS Code 并打开了本地文件夹。"})
+        return jsonify({"log": "✅ 已打开本地文件夹。"})
     except Exception as e:
-        return jsonify({"log": f"❌ 启动失败: {str(e)}"})
+        return jsonify({"log": f"❌ 打开失败: {str(e)}"})
 
 @app.route('/api/delete_local', methods=['POST'])
 def api_delete_local():
     name = request.json['name']
     path = os.path.join(BASE_DIR, name)
     try:
-        def remove_readonly(func, p, exc_info):
-            os.chmod(p, stat.S_IWRITE)
-            func(p)
         if os.path.exists(path):
-            shutil.rmtree(path, onerror=remove_readonly)
+            def remove_readonly(func, p, exc_info):
+                os.chmod(p, stat.S_IWRITE)
+                func(p)
+            try:
+                shutil.rmtree(path, onerror=remove_readonly)
+            except PermissionError:
+                if os.name == 'nt':
+                    temp_dir = os.path.join(BASE_DIR, '_empty_temp_del')
+                    os.makedirs(temp_dir, exist_ok=True)
+                    subprocess.run(['robocopy', temp_dir, path, '/MIR', '/NFL', '/NDL', '/NJH', '/NJS', '/NC', '/NS', '/NP'], 
+                                 capture_output=True, creationflags=0x08000000)
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    time.sleep(0.5)
+                    if os.path.exists(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                else:
+                    raise
         
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -1047,6 +1485,7 @@ def api_create():
         porcelain.init(target_path)
         r = Repo(target_path)
         r.refs.set_symbolic_ref(b'HEAD', b'refs/heads/main')
+        r.close()
         
         with open(os.path.join(target_path, "README.md"), "w", encoding="utf-8") as f:
             f.write(f"# {name}\nCreated by Web Manager")
@@ -1081,31 +1520,11 @@ def get_tray_icon():
     d.text((16, 24), "Git", fill=(255, 255, 255))
     return img
 
-def set_tkinter_icon(root):
-    try:
-        icon_path = get_resource_path("github_icon.png")
-        if not os.path.exists(icon_path):
-            req = urllib.request.Request("https://github.githubassets.com/favicons/favicon.png", headers={'User-Agent': 'Mozilla/5.0'})
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            with urllib.request.urlopen(req, timeout=3, context=ctx) as res:
-                with open(icon_path, 'wb') as f:
-                    f.write(res.read())
-        
-        img = Image.open(icon_path)
-        photo = ImageTk.PhotoImage(img)
-        root.iconphoto(True, photo)
-        root._window_icon = photo 
-    except Exception:
-        pass
-
 def create_systray():
     global systray_icon
     image = get_tray_icon()
     menu = pystray.Menu(
-        pystray.MenuItem("显示窗口", lambda: app_launcher.root.after(0, app_launcher.root.deiconify)),
-        pystray.MenuItem("进入 Web 页", lambda: webbrowser.open(f"http://127.0.0.1:{CURRENT_PORT}")),
+        pystray.MenuItem("打开 Web 工作台", lambda: webbrowser.open(f"http://127.0.0.1:{CURRENT_PORT}")),
         pystray.MenuItem("退出后台", lambda: exit_app())
     )
     systray_icon = pystray.Icon("GitHubTool", image, "GitHub 工作台", menu)
@@ -1116,52 +1535,22 @@ def exit_app():
         systray_icon.stop()
     os._exit(0)
 
-class LauncherApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("GitHub Server Starter")
-        self.root.geometry("400x150")
-        self.root.eval('tk::PlaceWindow . center')
-        
-        set_tkinter_icon(self.root)
-        
-        self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
-        
-        tk.Label(root, text="Personal Access Token:", font=("Arial", 10, "bold")).pack(pady=(15, 5))
-        self.token_var = tk.StringVar(value=get_token())
-        self.entry = tk.Entry(root, textvariable=self.token_var, width=45, show="*")
-        self.entry.pack(pady=5)
-        
-        self.start_btn = tk.Button(root, text="🚀 启动 Web 工作台", bg="#3b82f6", fg="white", font=("Arial", 10, "bold"), command=self.start_server)
-        self.start_btn.pack(pady=10)
-
-        self.root.after(100, self.auto_start_check)
-
-    def auto_start_check(self):
-        if self.token_var.get().strip():
-            self.start_server()
-
-    def start_server(self):
-        token = self.token_var.get().strip()
-        if not token:
-            messagebox.showwarning("提示", "请输入 Token 后再启动！")
-            return
-        save_token(token)
-        
-        self.start_btn.config(text="🌐 后台守护运行中...", bg="#64748b", state=tk.DISABLED)
-        
-        threading.Thread(target=lambda: app.run(port=CURRENT_PORT, host='127.0.0.1', use_reloader=False), daemon=True).start()
-        threading.Thread(target=create_systray, daemon=True).start()
-        
-        webbrowser.open(f"http://127.0.0.1:{CURRENT_PORT}")
-        self.root.withdraw() 
-
 if __name__ == "__main__":
     import logging
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     
-    root = tk.Tk()
-    global app_launcher
-    app_launcher = LauncherApp(root)
-    root.mainloop()
+    print(f"正在启动 GitHub 工作台...")
+    print(f"访问地址: http://127.0.0.1:{CURRENT_PORT}")
+    print("按 Ctrl+C 停止服务")
+    
+    threading.Thread(target=lambda: app.run(port=CURRENT_PORT, host='127.0.0.1', use_reloader=False), daemon=True).start()
+    threading.Thread(target=create_systray, daemon=True).start()
+    
+    webbrowser.open(f"http://127.0.0.1:{CURRENT_PORT}")
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        exit_app()
