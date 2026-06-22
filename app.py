@@ -319,7 +319,7 @@ HTML_TEMPLATE = """
 
     <div class="container">
         <div class="header">
-            <h1>🚀 GitHub 极客工作台</h1>
+            <h1>🚀 GitHub 极简工作台</h1>
             <div class="header-actions">
                 <button class="btn-primary" id="btn-fetch" onclick="fetchCloudRepos()">
                     <div class="spinner"></div><span>☁️ 刷新云端</span>
