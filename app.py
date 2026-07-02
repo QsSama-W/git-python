@@ -5,6 +5,7 @@ import sqlite3
 import json
 import urllib.request
 import urllib.error
+import urllib.parse
 import shutil
 import stat
 import webbrowser
@@ -12,12 +13,13 @@ import subprocess
 import time
 import socket
 import ssl
+import atexit
 from datetime import datetime, timezone, timedelta
 
 # 实例检测：防止程序重复启动
 try:
     instance_lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    instance_lock.bind(('127.0.0.1', 58763)) 
+    instance_lock.bind(('127.0.0.1', 58763))
 except Exception:
     print("程序已经在后台运行中了！请查看系统托盘图标。")
     sys.exit(0)
@@ -30,10 +32,6 @@ def get_free_port():
     return port
 
 CURRENT_PORT = get_free_port()
-
-# 设置全局代理环境（针对 GitHub API）
-os.environ["http_proxy"] = "http://127.0.0.1:10808"
-os.environ["https_proxy"] = "http://127.0.0.1:10808"
 
 try:
     from flask import Flask, request, jsonify, render_template_string, Response
@@ -50,35 +48,169 @@ def get_resource_path(relative_path):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath(os.path.dirname(__file__)), relative_path)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# exe 所在目录（打包后指向 exe 目录，开发时指向脚本目录）
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "manager_data.db")
+SINGBOX_PATH = get_resource_path("sing-box.exe")
 
 # 【核心修正】加入大量常见的 IDE、系统缓存、构建包目录，防止底层时间遍历时的幽灵误报
 IGNORE_PATTERNS = ('.db', '.log', '.sqlite', '.sqlite3', '.pyc', '.DS_Store', '.suo', '.user', '.pyo', '.pyd')
 IGNORE_NAMES = ('manager_data.db', '__pycache__', '.DS_Store')
 IGNORE_DIRS = {'.git', 'node_modules', 'venv', '.venv', '__pycache__', '.vscode', '.idea', '.cursor', '.github', 'dist', 'build', 'out', 'target'}
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, token TEXT)')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS projects (
-            id INTEGER PRIMARY KEY, name TEXT, path TEXT, repo_url TEXT, origin TEXT
-        )
-    ''')
-    cursor.execute("PRAGMA table_info(projects)")
-    columns = [info[1] for info in cursor.fetchall()]
-    if 'last_sync' not in columns:
-        cursor.execute("ALTER TABLE projects ADD COLUMN last_sync TEXT DEFAULT '缺省'")
-    cursor.execute("PRAGMA table_info(settings)")
-    setting_columns = [info[1] for info in cursor.fetchall()]
-    if 'v2ray_path' not in setting_columns:
-        cursor.execute("ALTER TABLE settings ADD COLUMN v2ray_path TEXT DEFAULT ''")
+# SingBox 代理相关
+SINGBOX_GLOBAL_CONFIG = os.path.join(BASE_DIR, "singbox_proxy.json")
+_singbox_process = None
 
-    cursor.execute("SELECT COUNT(*) FROM settings")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO settings (token) VALUES ('')")
+def proxy_urlopen(req, timeout=15):
+    """通过 HTTP 代理发起请求"""
+    return urllib.request.urlopen(req, timeout=timeout)
+
+def parse_vless_link(link, socks_port, http_port):
+    config = {
+        "log": {"level": "error"},
+        "inbounds": [
+            {
+                "type": "socks",
+                "listen": "127.0.0.1",
+                "listen_port": socks_port,
+            },
+            {
+                "type": "http",
+                "listen": "127.0.0.1",
+                "listen_port": http_port,
+            }
+        ],
+        "outbounds": [],
+    }
+    try:
+        parsed = urllib.parse.urlparse(link)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if not link.startswith("vless://"):
+            return None
+        outbound = {
+            "type": "vless",
+            "server": parsed.hostname,
+            "server_port": int(parsed.port),
+            "uuid": parsed.username,
+        }
+        flow = qs.get("flow", [""])[0]
+        if flow:
+            outbound["flow"] = flow
+        security = qs.get("security", [""])[0]
+        if security in ("tls", "reality"):
+            tls_cfg = {
+                "enabled": True,
+                "server_name": qs.get("sni", [parsed.hostname])[0],
+                "insecure": security != "reality",
+                "utls": {
+                    "enabled": True,
+                    "fingerprint": qs.get("fp", ["chrome"])[0],
+                },
+            }
+            if security == "reality":
+                tls_cfg["reality"] = {
+                    "enabled": True,
+                    "public_key": qs.get("pbk", [""])[0],
+                    "short_id": qs.get("sid", [""])[0],
+                }
+            outbound["tls"] = tls_cfg
+        net = qs.get("type", ["tcp"])[0]
+        if net == "ws":
+            outbound["transport"] = {
+                "type": "ws",
+                "path": qs.get("path", ["/"])[0],
+                "headers": {
+                    "Host": qs.get("host", [parsed.hostname])[0]
+                },
+            }
+        config["outbounds"].append(outbound)
+        return config
+    except Exception:
+        return None
+
+def start_singbox_proxy(vless_link):
+    global _singbox_process
+    stop_singbox_proxy()
+    if not os.path.exists(SINGBOX_PATH):
+        return {"status": "error", "msg": "未找到 sing-box.exe，请放在程序同级目录。"}
+    if not vless_link.startswith("vless://"):
+        return {"status": "error", "msg": "仅支持 vless:// 协议"}
+    socks_port = get_free_port()
+    http_port = get_free_port()
+    config_data = parse_vless_link(vless_link, socks_port, http_port)
+    if not config_data:
+        return {"status": "error", "msg": "VLESS 节点链接解析失败，请检查格式。"}
+    config_path = os.path.join(BASE_DIR, "singbox_proxy.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config_data, f, indent=2)
+    try:
+        _singbox_process = subprocess.Popen(
+            [SINGBOX_PATH, "run", "-c", config_path],
+            creationflags=0x08000000 if os.name == 'nt' else 0,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        time.sleep(1.5)
+        if _singbox_process.poll() is not None:
+            err = _singbox_process.stderr.read().decode('utf-8', errors='ignore')
+            _singbox_process = None
+            return {"status": "error", "msg": f"sing-box 启动失败: {err.strip()}"}
+        os.environ["http_proxy"] = f"http://127.0.0.1:{http_port}"
+        os.environ["https_proxy"] = f"http://127.0.0.1:{http_port}"
+        return {"status": "success", "msg": f"代理已启动 (HTTP端口 {http_port})", "port": http_port}
+    except Exception as e:
+        _singbox_process = None
+        return {"status": "error", "msg": f"启动失败: {str(e)}"}
+
+def stop_singbox_proxy():
+    global _singbox_process
+    if _singbox_process:
+        try:
+            if os.name == 'nt':
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(_singbox_process.pid)],
+                               capture_output=True, creationflags=0x08000000)
+            else:
+                _singbox_process.kill()
+        except Exception:
+            pass
+        _singbox_process = None
+    config_path = os.path.join(BASE_DIR, "singbox_proxy.json")
+    if os.path.exists(config_path):
+        try:
+            os.remove(config_path)
+        except Exception:
+            pass
+    os.environ.pop("http_proxy", None)
+    os.environ.pop("https_proxy", None)
+
+def is_singbox_running():
+    return _singbox_process is not None and _singbox_process.poll() is None
+
+atexit.register(stop_singbox_proxy)
+
+def get_vless_link():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT vless_link FROM proxy_nodes LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def save_vless_link(vless_link):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM proxy_nodes")
+    c.execute("INSERT INTO proxy_nodes (vless_link, is_active) VALUES (?, 1)", (vless_link,))
+    conn.commit()
+    conn.close()
+
+def delete_vless_link():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM proxy_nodes")
     conn.commit()
     conn.close()
 
@@ -97,39 +229,32 @@ def save_token(token):
     conn.commit()
     conn.close()
 
-def get_v2ray_path():
+def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT v2ray_path FROM settings WHERE id = 1")
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row and row[0] else ""
+    cursor.execute('CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, token TEXT)')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY, name TEXT, path TEXT, repo_url TEXT, origin TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS proxy_nodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vless_link TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1
+        )
+    ''')
+    cursor.execute("PRAGMA table_info(projects)")
+    columns = [info[1] for info in cursor.fetchall()]
+    if 'last_sync' not in columns:
+        cursor.execute("ALTER TABLE projects ADD COLUMN last_sync TEXT DEFAULT '缺省'")
 
-def save_v2ray_path(path):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE settings SET v2ray_path = ? WHERE id = 1", (path,))
+    cursor.execute("SELECT COUNT(*) FROM settings")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT INTO settings (token) VALUES ('')")
     conn.commit()
     conn.close()
-
-def start_v2rayn():
-    v2ray_path = get_v2ray_path()
-    if not v2ray_path:
-        return {"status": "error", "msg": "未配置 V2rayN 启动路径"}
-    if not os.path.exists(v2ray_path):
-        return {"status": "error", "msg": f"路径不存在: {v2ray_path}"}
-    try:
-        if os.name == 'nt':
-            subprocess.Popen(f'start "" "{v2ray_path}"', shell=True)
-        else:
-            subprocess.Popen([v2ray_path])
-        time.sleep(2)
-        if is_v2rayn_running():
-            return {"status": "success", "msg": "V2rayN 启动成功"}
-        else:
-            return {"status": "error", "msg": "启动命令已执行，但V2rayN进程未检测到"}
-    except Exception as e:
-        return {"status": "error", "msg": f"启动失败: {str(e)}"}
 
 def update_last_sync(name):
     conn = sqlite3.connect(DB_PATH)
@@ -284,34 +409,35 @@ HTML_TEMPLATE = """
     </div>
 
     <div id="settings-modal" class="modal">
-        <div class="modal-content" style="width: 450px;">
-            <h3>⚙️ 系统设置</h3>
-            <div class="input-group">
-                <label style="font-size: 13px; font-weight: 600; color:#334155;">GitHub Personal Access Token</label>
-                <p style="font-size: 12px; color: #64748b; margin: 4px 0 8px 0;">用于访问 GitHub API，需具备 repo 权限</p>
-                <input type="text" id="github-token-input" placeholder="ghp_xxxxxxxxxxxx" />
-                <div style="margin-top: 10px; display: flex; gap: 10px;">
-                    <button class="btn-success btn-sm" id="btn-save-token" onclick="saveGitHubToken()">
-                        <div class="spinner"></div><span>保存 Token</span>
-                    </button>
-                    <button class="btn-info btn-sm" onclick="testGitHubToken()">测试连接</button>
+        <div class="modal-content" style="width: 520px; max-height: 80vh; display: flex; flex-direction: column;">
+            <h3>系统设置</h3>
+            <div style="flex: 1; overflow-y: auto; min-height: 0;">
+                <div class="input-group">
+                    <label style="font-size: 13px; font-weight: 600; color:#334155;">GitHub Personal Access Token</label>
+                    <p style="font-size: 12px; color: #64748b; margin: 4px 0 8px 0;">用于访问 GitHub API，需具备 repo 权限</p>
+                    <input type="text" id="github-token-input" placeholder="ghp_xxxxxxxxxxxx" />
+                    <div style="margin-top: 10px; display: flex; gap: 10px;">
+                        <button class="btn-success btn-sm" id="btn-save-token" onclick="saveGitHubToken()">
+                            <div class="spinner"></div><span>保存 Token</span>
+                        </button>
+                        <button class="btn-info btn-sm" onclick="testGitHubToken()">测试连接</button>
+                    </div>
+                </div>
+                <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 16px 0;">
+                <div class="input-group">
+                    <label style="font-size: 13px; font-weight: 600; color:#334155;">VLESS 代理节点</label>
+                    <p style="font-size: 12px; color: #64748b; margin: 4px 0 8px 0;">添加 vless:// 链接，程序启动时自动通过 sing-box 代理访问 GitHub</p>
+                    <input type="text" id="node-link-input" placeholder="vless://..." style="width: 100%;" />
+                    <div style="margin-top: 10px; display: flex; gap: 10px; align-items: center;">
+                        <button class="btn-success btn-sm" id="btn-save-node" onclick="saveNode()">
+                            <div class="spinner"></div><span>保存节点</span>
+                        </button>
+                        <button class="btn-danger btn-sm" id="btn-delete-node" onclick="deleteNode()">删除节点</button>
+                        <span id="singbox-status" style="font-size: 12px; color: #64748b; margin-left: auto;"></span>
+                    </div>
                 </div>
             </div>
-            <div class="input-group">
-                <label style="font-size: 13px; font-weight: 600; color:#334155;">V2rayN 启动路径</label>
-                <p style="font-size: 12px; color: #64748b; margin: 4px 0 8px 0;">配置 V2rayN.exe 的完整路径，当代理未启动时可自动拉起</p>
-                <input type="text" id="v2ray-path-input" placeholder="例如：C:\\Program Files\\v2rayN\\v2rayN.exe" />
-                <div style="margin-top: 10px; display: flex; gap: 10px;">
-                    <button class="btn-success btn-sm" id="btn-save-v2ray-path" onclick="saveV2rayPath()">
-                        <div class="spinner"></div><span>保存路径</span>
-                    </button>
-                    <button class="btn-info btn-sm" id="btn-start-v2rayn" onclick="startV2rayN()">
-                        <div class="spinner"></div><span>启动 V2rayN</span>
-                    </button>
-                    <button class="btn-secondary btn-sm" onclick="testV2rayPath()">测试路径</button>
-                </div>
-            </div>
-            <div class="modal-actions">
+            <div class="modal-actions" style="margin-top: 12px;">
                 <button class="btn-primary" style="width: 100%;" onclick="closeSettingsModal()">完成</button>
             </div>
         </div>
@@ -319,7 +445,7 @@ HTML_TEMPLATE = """
 
     <div class="container">
         <div class="header">
-            <h1>🚀 GitHub 极简工作台</h1>
+            <h1>🚀 GitHub 极客工作台</h1>
             <div class="header-actions">
                 <button class="btn-primary" id="btn-fetch" onclick="fetchCloudRepos()">
                     <div class="spinner"></div><span>☁️ 刷新云端</span>
@@ -628,19 +754,18 @@ HTML_TEMPLATE = """
 
         async function checkInitInfo() {
             const res = await apiCall('/api/init_info', 'GET');
-            if(res && res.v2rayN_running === false) {
-                if (res.v2ray_path) {
-                    const shouldStart = await customConfirm("检测到后台 V2rayN 代理程序未运行！\\n\\n由于系统已配置强制通过 10808 端口代理，若没有对应的代理软件接收流量，获取云端数据可能会一直卡死或报错超时。\\n\\n是否自动启动 V2rayN？", "⚠️ 代理未运行警告");
-                    if (shouldStart) {
-                        const startRes = await apiCall('/api/start_v2rayn', 'POST');
-                        if (startRes.status === 'success') {
-                            showToast("V2rayN 已启动", "success");
-                        } else {
-                            showToast(startRes.msg || "启动失败", "error");
-                        }
+            if(res && res.proxy_running === false) {
+                const nodeRes = await apiCall('/api/proxy_node', 'GET');
+                if (nodeRes && nodeRes.vless_link) {
+                    log("检测到代理未运行，正在自动启动...");
+                    const startRes = await apiCall('/api/proxy/start', 'POST');
+                    if (startRes.status === 'success') {
+                        showToast("代理已自动启动", "success");
+                    } else {
+                        showToast(startRes.msg || "代理启动失败", "error");
                     }
                 } else {
-                    await customAlert("检测到后台 V2rayN 代理程序未运行！\\n\\n由于系统已配置强制通过 10808 端口代理，若没有对应的代理软件接收流量，获取云端数据可能会一直卡死或报错超时。\\n\\n请前往「设置」配置 V2rayN 启动路径，或手动启动 V2rayN。", "⚠️ 代理未运行警告");
+                    await customAlert("检测到代理未运行！\\n\\n请前往「设置」添加 VLESS 节点，程序将自动启动代理。", "代理未运行警告");
                 }
             }
         }
@@ -830,7 +955,7 @@ HTML_TEMPLATE = """
         function showSettingsModal() {
             document.getElementById('settings-modal').style.display = 'flex';
             loadGitHubToken();
-            loadV2rayPath();
+            loadProxyNode();
         }
 
         function closeSettingsModal() {
@@ -876,47 +1001,47 @@ HTML_TEMPLATE = """
             }
         }
 
-        async function loadV2rayPath() {
-            const res = await apiCall('/api/v2ray_path', 'GET');
-            if (res && res.path !== undefined) {
-                document.getElementById('v2ray-path-input').value = res.path;
+        async function loadProxyNode() {
+            const res = await apiCall('/api/proxy_node', 'GET');
+            const input = document.getElementById('node-link-input');
+            const statusEl = document.getElementById('singbox-status');
+            const deleteBtn = document.getElementById('btn-delete-node');
+            if (res) {
+                input.value = res.vless_link || '';
+                input.placeholder = res.vless_link ? '当前节点已配置' : 'vless://...';
+                deleteBtn.style.display = res.vless_link ? '' : 'none';
+                statusEl.textContent = res.proxy_running ? '代理运行中' : '代理未启动';
+                statusEl.style.color = res.proxy_running ? '#10b981' : '#64748b';
             }
         }
 
-        async function saveV2rayPath() {
-            const path = document.getElementById('v2ray-path-input').value.trim();
-            setLoading('btn-save-v2ray-path', true);
-            const res = await apiCall('/api/v2ray_path', 'POST', {path: path});
+        async function saveNode() {
+            const link = document.getElementById('node-link-input').value.trim();
+            if (!link) {
+                await customAlert("请输入 VLESS 链接", "提示");
+                return;
+            }
+            if (!link.startsWith('vless://')) {
+                await customAlert("仅支持 vless:// 协议", "提示");
+                return;
+            }
+            setLoading('btn-save-node', true);
+            const res = await apiCall('/api/proxy_node', 'POST', {vless_link: link});
             if (res.status === 'success') {
-                showToast("路径已保存", "success");
+                showToast("节点已保存，重启程序后自动生效", "success");
+                loadProxyNode();
             } else {
                 showToast(res.msg || "保存失败", "error");
             }
-            setLoading('btn-save-v2ray-path', false);
+            setLoading('btn-save-node', false);
         }
 
-        async function startV2rayN() {
-            setLoading('btn-start-v2rayn', true);
-            const res = await apiCall('/api/start_v2rayn', 'POST');
+        async function deleteNode() {
+            if (!await customConfirm("确定删除代理节点？删除后代理将停止。", "确认")) return;
+            const res = await apiCall('/api/proxy_node', 'DELETE');
             if (res.status === 'success') {
-                showToast("V2rayN 启动成功", "success");
-            } else {
-                showToast(res.msg || "启动失败", "error");
-            }
-            setLoading('btn-start-v2rayn', false);
-        }
-
-        async function testV2rayPath() {
-            const path = document.getElementById('v2ray-path-input').value.trim();
-            if (!path) {
-                await customAlert("请先输入路径", "提示");
-                return;
-            }
-            const res = await apiCall('/api/test_v2ray_path', 'POST', {path: path});
-            if (res.status === 'success') {
-                await customAlert("路径有效！", "测试成功");
-            } else {
-                await customAlert(res.msg || "路径无效", "测试失败");
+                showToast("节点已删除", "success");
+                loadProxyNode();
             }
         }
 
@@ -975,17 +1100,6 @@ HTML_TEMPLATE = """
 """
 
 app = Flask(__name__)
-
-def is_v2rayn_running():
-    if os.name == 'nt':
-        try:
-            result = subprocess.run(["tasklist", "/FI", "IMAGENAME eq v2rayn.exe"], capture_output=True, text=True, creationflags=0x08000000)
-            if "v2rayN" in result.stdout or "v2rayn.exe" in result.stdout.lower():
-                return True
-            return False
-        except Exception:
-            return True
-    return True
 
 def is_ignored(item_str):
     if any(item_str.endswith(ext) for ext in IGNORE_PATTERNS): return True
@@ -1059,7 +1173,7 @@ def api_ping():
 
 @app.route('/api/init_info', methods=['GET'])
 def api_init_info():
-    return jsonify({"v2rayN_running": is_v2rayn_running(), "v2ray_path": get_v2ray_path()})
+    return jsonify({"proxy_running": is_singbox_running()})
 
 @app.route('/api/github_token', methods=['GET', 'POST'])
 def api_github_token():
@@ -1085,7 +1199,7 @@ def api_test_github_token():
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json"
         })
-        with urllib.request.urlopen(req) as res:
+        with proxy_urlopen(req) as res:
             user_data = json.loads(res.read().decode())
             return jsonify({"status": "success", "msg": f"连接成功！用户: {user_data.get('login', 'unknown')}"})
     except urllib.error.HTTPError as e:
@@ -1095,34 +1209,40 @@ def api_test_github_token():
     except Exception as e:
         return jsonify({"status": "error", "msg": f"连接失败: {str(e)}"})
 
-@app.route('/api/v2ray_path', methods=['GET', 'POST'])
-def api_v2ray_path():
-    if request.method == 'GET':
-        return jsonify({"path": get_v2ray_path()})
-    else:
-        data = request.json
-        path = data.get('path', '').strip()
-        save_v2ray_path(path)
-        return jsonify({"status": "success", "msg": "路径已保存"})
+@app.route('/api/proxy_node', methods=['GET'])
+def api_get_proxy_node():
+    link = get_vless_link()
+    return jsonify({"vless_link": link or "", "proxy_running": is_singbox_running()})
 
-@app.route('/api/start_v2rayn', methods=['POST'])
-def api_start_v2rayn():
-    result = start_v2rayn()
+@app.route('/api/proxy_node', methods=['POST'])
+def api_save_proxy_node():
+    data = request.json
+    link = data.get('vless_link', '').strip()
+    if not link:
+        return jsonify({"status": "error", "msg": "链接不能为空"})
+    if not link.startswith('vless://'):
+        return jsonify({"status": "error", "msg": "仅支持 vless:// 协议"})
+    save_vless_link(link)
+    return jsonify({"status": "success"})
+
+@app.route('/api/proxy_node', methods=['DELETE'])
+def api_delete_proxy_node():
+    delete_vless_link()
+    stop_singbox_proxy()
+    return jsonify({"status": "success"})
+
+@app.route('/api/proxy/start', methods=['POST'])
+def api_start_proxy():
+    link = get_vless_link()
+    if not link:
+        return jsonify({"status": "error", "msg": "没有配置 VLESS 节点，请先添加"})
+    result = start_singbox_proxy(link)
     return jsonify(result)
 
-@app.route('/api/test_v2ray_path', methods=['POST'])
-def api_test_v2ray_path():
-    data = request.json
-    path = data.get('path', '').strip()
-    if not path:
-        return jsonify({"status": "error", "msg": "路径不能为空"})
-    if os.path.exists(path):
-        if path.lower().endswith('.exe'):
-            return jsonify({"status": "success", "msg": "路径有效"})
-        else:
-            return jsonify({"status": "error", "msg": "文件不是 .exe 格式"})
-    else:
-        return jsonify({"status": "error", "msg": "路径不存在"})
+@app.route('/api/proxy/stop', methods=['POST'])
+def api_stop_proxy():
+    stop_singbox_proxy()
+    return jsonify({"status": "success"})
 
 @app.route('/api/local_repos', methods=['GET'])
 def api_local_repos():
@@ -1162,7 +1282,7 @@ def api_fetch_cloud():
     }
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req) as res:
+        with proxy_urlopen(req) as res:
             repos = json.loads(res.read().decode())
             return jsonify({"status": "success", "repos": repos, "log": f"✅ 成功加载了 {len(repos)} 个云端项目。"})
     except Exception as e:
@@ -1189,7 +1309,7 @@ def api_sha_compare():
         req = urllib.request.Request(api_url, headers={"Authorization": f"token {token}", "Cache-Control": "no-cache"})
         
         try:
-            with urllib.request.urlopen(req) as res:
+            with proxy_urlopen(req) as res:
                 commits_data = json.loads(res.read().decode())
                 remote_sha = commits_data[0]['sha'] if commits_data else None
                 if commits_data:
@@ -1257,7 +1377,7 @@ def api_sync_check():
         req = urllib.request.Request(api_url, headers={"Authorization": f"token {token}", "Cache-Control": "no-cache"})
         
         try:
-            with urllib.request.urlopen(req) as res:
+            with proxy_urlopen(req) as res:
                 commits_data = json.loads(res.read().decode())
                 remote_sha = commits_data[0]['sha'] if commits_data else None
                 if commits_data:
@@ -1321,12 +1441,12 @@ def api_recreate_push():
         api_url = "https://api.github.com/user/repos"
         payload = json.dumps({"name": name, "private": is_private}).encode()
         req = urllib.request.Request(api_url, data=payload, headers={"Authorization": f"token {token}"})
-        with urllib.request.urlopen(req) as res:
+        with proxy_urlopen(req) as res:
             repo_info = json.loads(res.read().decode())
             clone_url = repo_info['clone_url']
 
         auth_url = clone_url.replace("https://", f"https://{token}@")
-        
+
         default_committer = b"GitHubAutoTool <tool@localhost>"
         real_changes, deleted_files, _ = get_real_changes(target_path)
         if real_changes: porcelain.add(target_path, paths=real_changes)
@@ -1477,7 +1597,7 @@ def api_create():
         api_url = "https://api.github.com/user/repos"
         payload = json.dumps({"name": name, "private": is_private}).encode()
         req = urllib.request.Request(api_url, data=payload, headers={"Authorization": f"token {token}"})
-        with urllib.request.urlopen(req) as res:
+        with proxy_urlopen(req) as res:
             repo_info = json.loads(res.read().decode())
             clone_url = repo_info['clone_url']
 
@@ -1531,6 +1651,7 @@ def create_systray():
     systray_icon.run()
 
 def exit_app():
+    stop_singbox_proxy()
     if 'systray_icon' in globals():
         systray_icon.stop()
     os._exit(0)

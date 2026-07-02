@@ -21,9 +21,9 @@
 - **彻底删除本地项目**：完全移除本地项目文件夹
 
 ### 🌐 网络支持
-- **代理配置**：支持配置 HTTP/HTTPS 代理
-- **V2rayN 集成**：可自动检测和启动 V2rayN 代理程序
-- **代理检测**：启动时自动检测代理状态并提醒
+- **SingBox 代理**：内置 sing-box 支持，通过 VLESS 节点代理访问 GitHub
+- **自动启动**：配置节点后，程序启动自动开启代理
+- **HTTP 代理**：sing-box 同时提供 SOCKS5 和 HTTP 代理
 
 ### 🖥️ 界面特性
 - **现代化 UI**：简洁美观的 Web 界面
@@ -39,19 +39,32 @@
 
 ## 🚀 安装与运行
 
-### 1. 安装依赖
+### 1. 下载 sing-box
+
+双击运行 `下载sing-box.bat`，自动从 GitHub 下载 sing-box.exe 到程序目录。
+
+### 2. 安装依赖
 
 ```bash
-pip install flask dulwich pystray pillow
+pip install -r requirements.txt
 ```
 
-### 2. 启动应用
+### 3. 启动应用
 
 ```bash
 python app.py
 ```
 
 启动后会自动打开浏览器访问 `http://127.0.0.1:<端口号>`，同时在系统托盘显示图标。
+
+### 4. 打包为 exe（可选）
+
+```bash
+pip install pyinstaller
+python build.py
+```
+
+打包完成后在 `dist\GitHub推送工具\` 目录下找到可执行文件。
 
 ## ⚙️ 配置说明
 
@@ -67,19 +80,20 @@ python app.py
 2. 选择 Personal access tokens → Tokens (classic)
 3. 生成新 Token，勾选 `repo` 权限
 
-### V2rayN 代理
+### VLESS 代理节点
 
-1. 在设置面板中配置 V2rayN.exe 的完整路径
-2. 保存路径后，系统会在启动时自动检测代理状态
-3. 如检测到代理未运行，会自动弹窗提示是否启动
+1. 在设置面板中粘贴 `vless://` 链接
+2. 保存后，程序启动时自动通过 sing-box 启动代理
+3. 无需手动配置代理软件
 
 ## 🔧 使用指南
 
 ### 首次使用
 
-1. 启动应用后，点击右上角 ⚙️ 按钮打开设置
-2. 配置 GitHub Token
-3. 点击 ☁️ "刷新云端" 获取云端仓库列表
+1. 双击 `下载sing-box.bat` 获取代理工具
+2. 启动应用后，点击右上角 ⚙️ 按钮打开设置
+3. 配置 GitHub Token 和 VLESS 节点
+4. 点击 ☁️ "刷新云端" 获取云端仓库列表
 
 ### 日常同步
 
@@ -100,12 +114,12 @@ python app.py
 
 - 数据库文件：`manager_data.db`（SQLite）
 - 本地项目：存储在应用所在目录下
-- 配置项：GitHub Token、V2rayN 路径
+- 配置项：GitHub Token、VLESS 节点链接
 
 ## ⚠️ 注意事项
 
 1. **Token 安全**：Token 本地存储，请勿泄露
-2. **代理配置**：如遇网络问题，请确认代理软件已启动
+2. **代理配置**：如遇网络问题，请确认 VLESS 节点配置正确且 sing-box.exe 存在
 3. **项目路径**：本地项目存储在应用同级目录，避免移动应用位置
 4. **数据备份**：重要项目建议定期备份
 
@@ -120,12 +134,16 @@ A: 确认本地项目是有效的 Git 仓库，且 Token 具有相应权限。
 **Q: 系统托盘图标不显示？**
 A: 部分系统可能需要重启应用或检查托盘图标设置。
 
+**Q: 代理启动失败？**
+A: 确认 sing-box.exe 在程序目录下，且 VLESS 节点链接格式正确。
+
 ## 📝 开发说明
 
 本工具使用以下技术栈：
 - **后端**：Flask + dulwich（纯 Python Git 实现）
 - **前端**：原生 HTML/CSS/JavaScript
 - **存储**：SQLite
+- **代理**：sing-box（VLESS 协议）
 - **系统集成**：pystray（系统托盘）、Pillow（图标）
 
 ## 📄 License
