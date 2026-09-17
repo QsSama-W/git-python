@@ -48,7 +48,6 @@ def get_resource_path(relative_path):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath(os.path.dirname(__file__)), relative_path)
 
-# exe 所在目录（打包后指向 exe 目录，开发时指向脚本目录）
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
@@ -56,17 +55,14 @@ else:
 DB_PATH = os.path.join(BASE_DIR, "manager_data.db")
 SINGBOX_PATH = get_resource_path("sing-box.exe")
 
-# 【核心修正】加入大量常见的 IDE、系统缓存、构建包目录，防止底层时间遍历时的幽灵误报
 IGNORE_PATTERNS = ('.db', '.log', '.sqlite', '.sqlite3', '.pyc', '.DS_Store', '.suo', '.user', '.pyo', '.pyd')
 IGNORE_NAMES = ('manager_data.db', '__pycache__', '.DS_Store')
 IGNORE_DIRS = {'.git', 'node_modules', 'venv', '.venv', '__pycache__', '.vscode', '.idea', '.cursor', '.github', 'dist', 'build', 'out', 'target'}
 
-# SingBox 代理相关
 SINGBOX_GLOBAL_CONFIG = os.path.join(BASE_DIR, "singbox_proxy.json")
 _singbox_process = None
 
 def proxy_urlopen(req, timeout=15):
-    """通过 HTTP 代理发起请求"""
     return urllib.request.urlopen(req, timeout=timeout)
 
 def parse_vless_link(link, socks_port, http_port):
@@ -214,25 +210,41 @@ def delete_vless_link():
     conn.commit()
     conn.close()
 
-def get_token():
+def get_active_token_info():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT token FROM settings WHERE id = 1")
+    cursor.execute("SELECT token, remark FROM access_tokens WHERE is_active = 1 LIMIT 1")
     row = cursor.fetchone()
     conn.close()
-    return row[0] if row else ""
+    if row:
+        return row[0], row[1] if row[1] else "未命名账号"
+    return "", "默认账号"
 
-def save_token(token):
+def get_token():
+    return get_active_token_info()[0]
+
+def get_project_by_id(pid):
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE settings SET token = ? WHERE id = 1", (token,))
-    conn.commit()
+    c = conn.cursor()
+    c.execute("SELECT name, path, repo_url, owner_name FROM projects WHERE id = ?", (pid,))
+    row = c.fetchone()
     conn.close()
+    return row
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, token TEXT)')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS access_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT UNIQUE,
+            remark TEXT,
+            is_active INTEGER DEFAULT 0
+        )
+    ''')
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY, name TEXT, path TEXT, repo_url TEXT, origin TEXT
@@ -245,23 +257,34 @@ def init_db():
             is_active INTEGER DEFAULT 1
         )
     ''')
+    
     cursor.execute("PRAGMA table_info(projects)")
     columns = [info[1] for info in cursor.fetchall()]
     if 'last_sync' not in columns:
         cursor.execute("ALTER TABLE projects ADD COLUMN last_sync TEXT DEFAULT '缺省'")
+    if 'owner_name' not in columns:
+        cursor.execute("ALTER TABLE projects ADD COLUMN owner_name TEXT DEFAULT 'Unknown'")
 
     cursor.execute("SELECT COUNT(*) FROM settings")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT INTO settings (token) VALUES ('')")
+        
+    cursor.execute("SELECT COUNT(*) FROM access_tokens")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("SELECT token FROM settings WHERE id = 1")
+        row = cursor.fetchone()
+        if row and row[0]:
+            cursor.execute("INSERT OR IGNORE INTO access_tokens (token, remark, is_active) VALUES (?, ?, 1)", (row[0], "默认",))
+            
     conn.commit()
     conn.close()
 
-def update_last_sync(name):
+def update_last_sync(pid):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     tz_utc8 = timezone(timedelta(hours=8))
     now_str = datetime.now(tz_utc8).strftime('%Y-%m-%d %H:%M:%S')
-    c.execute("UPDATE projects SET last_sync = ? WHERE name = ?", (now_str, name))
+    c.execute("UPDATE projects SET last_sync = ? WHERE id = ?", (now_str, pid))
     conn.commit()
     conn.close()
 
@@ -352,8 +375,8 @@ HTML_TEMPLATE = """
         .modal-content h3 { margin-top: 0; margin-bottom: 12px; color: #0f172a; font-size: 18px; }
         .modal-content p { color: #475569; font-size: 14px; line-height: 1.5; margin-bottom: 16px; word-break: break-all; }
         .input-group { margin-bottom: 14px; }
-        .input-group input[type="text"] { width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; outline: none; margin-top: 6px; font-size: 14px;}
-        .input-group input[type="text"]:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15); }
+        .input-group input[type="text"], .input-group select { width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; outline: none; margin-top: 6px; font-size: 14px; box-sizing: border-box;}
+        .input-group input[type="text"]:focus, .input-group select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15); }
         .modal-actions { display: flex; gap: 10px; margin-top: auto; }
         
         #offline-overlay { display: none; position: fixed; top:0; left:0; width:100%; height:100%; background: #0f172a; color: white; z-index: 99999; flex-direction: column; justify-content: center; align-items: center; text-align: center;}
@@ -413,14 +436,26 @@ HTML_TEMPLATE = """
             <h3>系统设置</h3>
             <div style="flex: 1; overflow-y: auto; min-height: 0;">
                 <div class="input-group">
-                    <label style="font-size: 13px; font-weight: 600; color:#334155;">GitHub Personal Access Token</label>
-                    <p style="font-size: 12px; color: #64748b; margin: 4px 0 8px 0;">用于访问 GitHub API，需具备 repo 权限</p>
+                    <label style="font-size: 13px; font-weight: 600; color:#334155; display:flex; align-items:center; justify-content:space-between;">
+                        <span>GitHub Personal Access Token</span>
+                        <span id="current-token-remark" style="color:var(--primary); font-size: 11px; background:#eff6ff; padding:2px 6px; border-radius:4px;"></span>
+                    </label>
+                    <p style="font-size: 12px; color: #64748b; margin: 4px 0 8px 0;">用于访问 GitHub API，需具备 repo 权限（保存时自动以 GitHub ID 作为标识名）</p>
+                    
+                    <select id="token-select" onchange="onTokenSelectChange()" style="margin-bottom: 8px; padding: 6px; font-size: 13px;">
+                        <option value="">-- 选择或输入新的 Token --</option>
+                    </select>
+                    
                     <input type="text" id="github-token-input" placeholder="ghp_xxxxxxxxxxxx" />
+                    
                     <div style="margin-top: 10px; display: flex; gap: 10px;">
                         <button class="btn-success btn-sm" id="btn-save-token" onclick="saveGitHubToken()">
-                            <div class="spinner"></div><span>保存 Token</span>
+                            <div class="spinner"></div><span>保存并启用</span>
                         </button>
                         <button class="btn-info btn-sm" onclick="testGitHubToken()">测试连接</button>
+                        <button class="btn-danger btn-sm" id="btn-delete-token" onclick="deleteGitHubToken()">
+                            <div class="spinner"></div><span>删除当前</span>
+                        </button>
                     </div>
                 </div>
                 <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 16px 0;">
@@ -505,16 +540,15 @@ HTML_TEMPLATE = """
         let repoToRecreate = null;
         let selectedLocalIndex = -1;
         let selectedCloudIndex = -1;
+        let savedTokens = [];
 
         const CLOUD_TOLERANCE_MS = 60000; 
         const LOCAL_TOLERANCE_MS = 2000; 
         
         const shaCheckCache = {};
 
-        // 【核心修正】强制时区对齐，防止因系统时区不同导致几小时的巨型误报
         function parseUTC8Time(timeStr) {
             if (!timeStr || timeStr === '缺省') return 0;
-            // 将 "YYYY-MM-DD HH:MM:SS" 强转为 ISO 8601 并追加 +08:00
             const isoStr = timeStr.replace(' ', 'T') + '+08:00'; 
             return new Date(isoStr).getTime();
         }
@@ -611,11 +645,10 @@ HTML_TEMPLATE = """
             }
         }
 
-        // 【核心修正】更加完善的状态核对中心，防止“空保存穿透”
         async function updateRepoStatuses() {
             for (let i = 0; i < localRepos.length; i++) {
                 const r = localRepos[i];
-                const cloudRepo = cloudRepos.find(c => c.name === r.name);
+                const cloudRepo = cloudRepos.find(c => c.name === r.name && c.owner.login === r.owner_name);
                 const extraDiv = document.getElementById(`meta-extra-${i}`);
 
                 if (extraDiv) extraDiv.innerHTML = '';
@@ -623,30 +656,24 @@ HTML_TEMPLATE = """
                 if (cloudRepo && r.local_mtime !== '缺省') {
                     const localTime = parseUTC8Time(r.local_mtime);
                     const syncTime = parseUTC8Time(r.last_sync);
-                    
-                    // 修复 Github 假更新：使用 pushed_at (真实代码提交时间) 替代 updated_at (Star/Issue 时间)
                     const cloudTimeStr = cloudRepo.pushed_at || cloudRepo.updated_at;
                     const cloudTime = new Date(cloudTimeStr).getTime();
 
                     let determinedStatus = null;
-                    let needsShaCheck = false; // 是否需要进行精确防误报核验
+                    let needsShaCheck = false;
 
                     if (syncTime > 0) {
                         if (cloudTime > syncTime + CLOUD_TOLERANCE_MS || localTime > syncTime + LOCAL_TOLERANCE_MS) {
-                            // 时间超出了上次同步锚点，可能有人写了代码，也可能是空保存。交给后台精确查验。
                             needsShaCheck = true;
                         } else {
-                            // 一切都在锚点内，绝对是没碰过的
                             determinedStatus = 'same';
                         }
                     } else {
-                        // 首次运行或无锚点记录，强行核对一次
                         needsShaCheck = true;
                     }
 
                     if (needsShaCheck) {
-                        // 利用 mtime 作为缓存锁，mtime不变更就不会重复耗费 API 请求
-                        const cacheKey = `${r.name}_${r.local_mtime}_${cloudTimeStr}`;
+                        const cacheKey = `${r.id}_${r.local_mtime}_${cloudTimeStr}`;
                         if (shaCheckCache[cacheKey]) {
                             if (shaCheckCache[cacheKey] !== 'pending') {
                                 applyShaStatus(shaCheckCache[cacheKey], i);
@@ -658,7 +685,7 @@ HTML_TEMPLATE = """
                                 const res = await fetch('/api/sha_compare', {
                                     method: 'POST',
                                     headers: {'Content-Type': 'application/json'},
-                                    body: JSON.stringify({name: r.name, url: r.repo_url})
+                                    body: JSON.stringify({id: r.id})
                                 });
                                 const data = await res.json();
                                 if (data.status && data.status !== 'error') {
@@ -678,7 +705,7 @@ HTML_TEMPLATE = """
                     }
                 } else if (!cloudRepo) {
                     if (extraDiv) {
-                        extraDiv.innerHTML = '<span style="color: #f59e0b; font-weight: bold; display: block; margin-top: 5px;">⚠️ 云端未找到该项目，可能已被删除或未上云</span>';
+                        extraDiv.innerHTML = '<span style="color: #f59e0b; font-weight: bold; display: block; margin-top: 5px;">⚠️ 当前账户云端未找到该项目</span>';
                     }
                 }
             }
@@ -716,7 +743,7 @@ HTML_TEMPLATE = """
                         needsFullRender = true;
                     } else {
                         for(let i=0; i<data.repos.length; i++) {
-                            if(data.repos[i].name !== localRepos[i].name) {
+                            if(data.repos[i].id !== localRepos[i].id) {
                                 needsFullRender = true;
                                 break;
                             }
@@ -724,10 +751,10 @@ HTML_TEMPLATE = """
                     }
 
                     if(needsFullRender) {
-                        const oldSelectedName = selectedLocalIndex >= 0 ? localRepos[selectedLocalIndex].name : null;
+                        const oldSelectedId = selectedLocalIndex >= 0 ? localRepos[selectedLocalIndex].id : null;
                         await loadLocalRepos(); 
-                        if(oldSelectedName) {
-                            const newIdx = localRepos.findIndex(r => r.name === oldSelectedName);
+                        if(oldSelectedId) {
+                            const newIdx = localRepos.findIndex(r => r.id === oldSelectedId);
                             if(newIdx !== -1) {
                                 selectedLocalIndex = newIdx;
                                 document.getElementById('local-list').children[newIdx].classList.add('active');
@@ -782,8 +809,10 @@ HTML_TEMPLATE = """
                     div.className = 'list-item';
                     div.innerHTML = `
                         <div class="item-header">
-                            <span class="item-name">📦 ${r.name}</span>
-                            <span class="badge">${r.origin}</span>
+                            <span class="item-name">📦 ${r.owner_name} / ${r.name}</span>
+                            <div style="display:flex; gap:6px;">
+                                <span class="badge">${r.origin}</span>
+                            </div>
                         </div>
                         <div class="item-meta">
                             <span id="mtime-${idx}">🕒 <b>最后修改:</b> ${r.local_mtime}</span>
@@ -828,7 +857,7 @@ HTML_TEMPLATE = """
                         div.className = 'list-item';
                         div.innerHTML = `
                             <div class="item-header">
-                                <span class="item-name">☁️ ${r.name}</span>
+                                <span class="item-name">☁️ ${r.owner.login} / ${r.name}</span>
                                 ${r.private ? '<span class="badge" style="background:#fef08a;color:#854d0e;">私有</span>' : ''}
                             </div>
                             <div class="item-meta">
@@ -862,8 +891,12 @@ HTML_TEMPLATE = """
             const btnId = `btn-pull-${idx}`;
             setLoading(btnId, true);
             const repo = cloudRepos[idx];
-            log(`开始拉取: ${repo.name}...`);
-            const res = await apiCall('/api/pull', 'POST', {name: repo.name, url: repo.clone_url});
+            log(`开始拉取: ${repo.owner.login}/${repo.name}...`);
+            const res = await apiCall('/api/pull', 'POST', {
+                name: repo.name, 
+                url: repo.clone_url,
+                owner_name: repo.owner.login
+            });
             if(res.log && res.log.includes('✅')) showToast(`已成功拉取 ${repo.name}`);
             await loadLocalRepos();
             setLoading(btnId, false);
@@ -874,9 +907,9 @@ HTML_TEMPLATE = """
             const btnId = `btn-sync-${idx}`;
             setLoading(btnId, true);
             const repo = localRepos[idx];
-            log(`开始智能分析 [${repo.name}] ...`);
+            log(`开始智能分析 [${repo.owner_name}/${repo.name}] ...`);
             
-            const checkData = await apiCall('/api/sync_check', 'POST', {name: repo.name, url: repo.repo_url});
+            const checkData = await apiCall('/api/sync_check', 'POST', {id: repo.id});
             
             if (checkData.status === 'not_found') {
                 setLoading(btnId, false);
@@ -886,7 +919,7 @@ HTML_TEMPLATE = """
                 return;
             } else if (checkData.status === 'need_push') {
                 if(await customConfirm(checkData.msg, "推送确认")) {
-                    const p = await apiCall('/api/push', 'POST', {name: repo.name, url: repo.repo_url});
+                    const p = await apiCall('/api/push', 'POST', {id: repo.id});
                     if(p.log && p.log.includes('✅')) { 
                         showToast("推送成功"); 
                         await loadLocalRepos(); 
@@ -896,7 +929,7 @@ HTML_TEMPLATE = """
                 } else { log("已取消推送。"); }
             } else if (checkData.status === 'need_pull') {
                 if(await customConfirm(checkData.msg, "覆盖确认")) {
-                    const p = await apiCall('/api/pull_update', 'POST', {name: repo.name, url: repo.repo_url});
+                    const p = await apiCall('/api/pull_update', 'POST', {id: repo.id});
                     if(p.log && p.log.includes('✅')) { 
                         showToast("拉取覆盖成功"); 
                         await loadLocalRepos(); 
@@ -915,7 +948,7 @@ HTML_TEMPLATE = """
             const btnId = `btn-vscode-${idx}`;
             setLoading(btnId, true);
             const repo = localRepos[idx];
-            await apiCall('/api/vscode', 'POST', {name: repo.name});
+            await apiCall('/api/vscode', 'POST', {id: repo.id});
             setLoading(btnId, false);
         }
 
@@ -924,7 +957,7 @@ HTML_TEMPLATE = """
             const btnId = `btn-folder-${idx}`;
             setLoading(btnId, true);
             const repo = localRepos[idx];
-            await apiCall('/api/open_folder', 'POST', {name: repo.name});
+            await apiCall('/api/open_folder', 'POST', {id: repo.id});
             setLoading(btnId, false);
         }
 
@@ -938,10 +971,10 @@ HTML_TEMPLATE = """
         async function deleteLocal(idx, event) {
             if(event) event.stopPropagation();
             const repo = localRepos[idx];
-            if(await customConfirm(`警告：确定彻底删除本地的 [${repo.name}] 项目文件夹吗？\\n\\n该操作无法撤销，但不会影响 GitHub 云端代码。`, "⚠️ 危险操作确认")) {
+            if(await customConfirm(`警告：确定彻底删除本地的 [${repo.owner_name}/${repo.name}] 项目文件夹吗？\\n\\n该操作无法撤销，但不会影响 GitHub 云端代码。`, "⚠️ 危险操作确认")) {
                 const btnId = `btn-del-${idx}`;
                 setLoading(btnId, true);
-                const res = await apiCall('/api/delete_local', 'POST', {name: repo.name});
+                const res = await apiCall('/api/delete_local', 'POST', {id: repo.id});
                 if(res.log && res.log.includes('✅')) showToast(`已彻底删除 ${repo.name}`);
                 await loadLocalRepos();
             }
@@ -954,7 +987,7 @@ HTML_TEMPLATE = """
 
         function showSettingsModal() {
             document.getElementById('settings-modal').style.display = 'flex';
-            loadGitHubToken();
+            loadGitHubTokens();
             loadProxyNode();
         }
 
@@ -962,10 +995,39 @@ HTML_TEMPLATE = """
             document.getElementById('settings-modal').style.display = 'none';
         }
 
-        async function loadGitHubToken() {
-            const res = await apiCall('/api/github_token', 'GET');
-            if (res && res.masked !== undefined) {
-                document.getElementById('github-token-input').placeholder = res.masked || 'ghp_xxxxxxxxxxxx';
+        async function loadGitHubTokens() {
+            const res = await apiCall('/api/github_tokens', 'GET');
+            if (res && res.tokens) {
+                savedTokens = res.tokens;
+                const select = document.getElementById('token-select');
+                select.innerHTML = '<option value="">-- 选择或输入新的 Token --</option>';
+                let activeToken = null;
+                
+                res.tokens.forEach(t => {
+                    const opt = document.createElement('option');
+                    opt.value = t.token;
+                    opt.textContent = `${t.remark || '无备注'} (${t.token.substring(0,8)}...)`;
+                    select.appendChild(opt);
+                    if (t.is_active) activeToken = t;
+                });
+
+                if (activeToken) {
+                    select.value = activeToken.token;
+                    document.getElementById('github-token-input').value = activeToken.token;
+                    document.getElementById('current-token-remark').textContent = activeToken.remark ? `🟢 当前启用: ${activeToken.remark}` : '🟢 当前启用';
+                } else {
+                    document.getElementById('github-token-input').value = '';
+                    document.getElementById('current-token-remark').textContent = '未配置 Token';
+                }
+            }
+        }
+
+        function onTokenSelectChange() {
+            const val = document.getElementById('token-select').value;
+            const t = savedTokens.find(x => x.token === val);
+            if (t) {
+                document.getElementById('github-token-input').value = t.token;
+            } else {
                 document.getElementById('github-token-input').value = '';
             }
         }
@@ -977,14 +1039,38 @@ HTML_TEMPLATE = """
                 return;
             }
             setLoading('btn-save-token', true);
+            
             const res = await apiCall('/api/github_token', 'POST', {token: token});
             if (res.status === 'success') {
-                showToast("Token 已保存", "success");
-                loadGitHubToken();
+                showToast(res.msg, "success");
+                await loadGitHubTokens();
+                await loadLocalRepos();
+                await fetchCloudRepos();
             } else {
                 showToast(res.msg || "保存失败", "error");
             }
             setLoading('btn-save-token', false);
+        }
+
+        async function deleteGitHubToken() {
+            const token = document.getElementById('github-token-input').value.trim();
+            if (!token) {
+                await customAlert("输入框中没有可以删除的 Token", "提示");
+                return;
+            }
+            if (!await customConfirm("确认要从本地删除当前显示的该 Token 吗？", "删除确认")) return;
+
+            setLoading('btn-delete-token', true);
+            const res = await apiCall('/api/github_token', 'DELETE', {token: token});
+            if (res.status === 'success') {
+                showToast("Token 已删除", "success");
+                await loadGitHubTokens();
+                await loadLocalRepos();
+                await fetchCloudRepos();
+            } else {
+                showToast(res.msg || "删除失败", "error");
+            }
+            setLoading('btn-delete-token', false);
         }
 
         async function testGitHubToken() {
@@ -1052,7 +1138,7 @@ HTML_TEMPLATE = """
             log(`准备重新创建并推送项目: ${repoToRecreate.name}...`);
             
             const res = await apiCall('/api/recreate_push', 'POST', {
-                name: repoToRecreate.name, 
+                id: repoToRecreate.id, 
                 is_private: isPrivate
             });
             
@@ -1106,6 +1192,11 @@ def is_ignored(item_str):
     if any(name in item_str for name in IGNORE_NAMES): return True
     return False
 
+# -------------------------------------------------------------
+# 【完全对齐历史版本 app_2.py】的 get_real_changes
+# 修复了近期版本为了兼容 subprocess 或是处理字符串产生的隐蔽类型错误。
+# 严格保留底层返回值为原生 bytes 类型，确保 dulwich 和 porcelain 的类型校验通过。
+# -------------------------------------------------------------
 def get_real_changes(path):
     status = porcelain.status(path)
     real_changes = []
@@ -1175,17 +1266,79 @@ def api_ping():
 def api_init_info():
     return jsonify({"proxy_running": is_singbox_running()})
 
-@app.route('/api/github_token', methods=['GET', 'POST'])
-def api_github_token():
-    if request.method == 'GET':
-        token = get_token()
-        masked = token[:4] + '****' + token[-4:] if len(token) > 8 else token
-        return jsonify({"token": token, "masked": masked})
+@app.route('/api/github_tokens', methods=['GET'])
+def api_get_tokens():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, token, remark, is_active FROM access_tokens ORDER BY is_active DESC, id ASC")
+    rows = c.fetchall()
+    conn.close()
+    tokens = [{"id": r[0], "token": r[1], "remark": r[2], "is_active": r[3]} for r in rows]
+    return jsonify({"tokens": tokens})
+
+@app.route('/api/github_token', methods=['POST'])
+def api_save_token():
+    data = request.json
+    token = data.get('token', '').strip()
+    
+    if not token:
+        return jsonify({"status": "error", "msg": "Token不能为空"})
+        
+    github_id = "未知账号"
+    try:
+        url = "https://api.github.com/user"
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json"
+        })
+        with proxy_urlopen(req) as res:
+            user_data = json.loads(res.read().decode())
+            if 'login' in user_data:
+                github_id = user_data['login']
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return jsonify({"status": "error", "msg": "Token 无效或已过期，保存失败"})
+        return jsonify({"status": "error", "msg": f"验证失败 HTTP {e.code}，保存失败"})
+    except Exception as e:
+        return jsonify({"status": "error", "msg": f"网络连接失败: {str(e)}"})
+        
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE access_tokens SET is_active = 0")
+    
+    c.execute("SELECT id FROM access_tokens WHERE token = ?", (token,))
+    if c.fetchone():
+        c.execute("UPDATE access_tokens SET is_active = 1, remark = ? WHERE token = ?", (github_id, token))
     else:
-        data = request.json
-        token = data.get('token', '').strip()
-        save_token(token)
-        return jsonify({"status": "success", "msg": "Token 已保存"})
+        c.execute("INSERT INTO access_tokens (token, remark, is_active) VALUES (?, ?, 1)", (token, github_id))
+        
+    c.execute("UPDATE settings SET token = ? WHERE id = 1", (token,))
+    
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success", "msg": f"Token 已保存并启用 (账号: {github_id})"})
+
+@app.route('/api/github_token', methods=['DELETE'])
+def api_delete_token():
+    data = request.json
+    token = data.get('token', '').strip()
+    if not token:
+        return jsonify({"status": "error", "msg": "Token 不能为空"})
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT is_active FROM access_tokens WHERE token = ?", (token,))
+    row = c.fetchone()
+    was_active = row and row[0] == 1
+    
+    c.execute("DELETE FROM access_tokens WHERE token = ?", (token,))
+    if was_active:
+        c.execute("UPDATE settings SET token = '' WHERE id = 1")
+        
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success"})
 
 @app.route('/api/test_github_token', methods=['POST'])
 def api_test_github_token():
@@ -1248,29 +1401,40 @@ def api_stop_proxy():
 def api_local_repos():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT name, origin, repo_url, last_sync FROM projects")
+    
+    _, active_owner = get_active_token_info()
+    
+    if active_owner in ("", "未命名账号", "默认账号"):
+        conn.close()
+        return jsonify({"repos": []})
+        
+    cursor.execute("SELECT id, name, origin, repo_url, last_sync, path, owner_name FROM projects WHERE owner_name = ?", (active_owner,))
     rows = cursor.fetchall()
     conn.close()
     
     valid_repos = []
     
     for r in rows:
-        p_name, origin, repo_url, last_sync = r[0], r[1], r[2], r[3]
-        p_path = os.path.join(BASE_DIR, p_name)
+        p_id, p_name, origin, repo_url, last_sync, p_path, owner_name = r
         if os.path.exists(p_path):
             local_mtime = get_project_mtime(p_path)
             valid_repos.append({
+                "id": p_id,
                 "name": p_name, 
                 "origin": origin, 
                 "repo_url": repo_url,
                 "last_sync": last_sync if last_sync else "缺省",
-                "local_mtime": local_mtime
+                "local_mtime": local_mtime,
+                "owner_name": owner_name
             })
     return jsonify({"repos": valid_repos})
 
 @app.route('/api/fetch_cloud', methods=['POST'])
 def api_fetch_cloud():
     token = get_token()
+    if not token:
+        return jsonify({"status": "error", "log": "❌ 获取云端失败: 请先在设置中保存并启用 Token。"})
+        
     ts = int(time.time() * 1000)
     url = f"https://api.github.com/user/repos?per_page=100&sort=updated&t={ts}"
     
@@ -1291,12 +1455,16 @@ def api_fetch_cloud():
 @app.route('/api/sha_compare', methods=['POST'])
 def api_sha_compare():
     data = request.json
-    p_name = data['name']
-    p_url = data['url']
-    p_path = os.path.join(BASE_DIR, p_name)
+    pid = data.get('id')
+    row = get_project_by_id(pid)
+    if not row:
+        return jsonify({"status": "error"})
+        
+    p_name, p_path, p_url, _ = row
     token = get_token()
 
     try:
+        # 这个环节将依赖完全回滚的 get_real_changes 来识别 p_path 下的变更
         real_changes, deleted_files, staged_files = get_real_changes(p_path)
         if real_changes or deleted_files or staged_files:
             return jsonify({"status": "local_newer"})
@@ -1342,33 +1510,41 @@ def api_pull():
     data = request.json
     name = data['name']
     clone_url = data['url']
-    target_path = os.path.join(BASE_DIR, name)
+    owner_name = data.get('owner_name', 'Unknown')
+    
     token = get_token()
+    account_dir = os.path.join(BASE_DIR, owner_name)
+    os.makedirs(account_dir, exist_ok=True)
+    target_path = os.path.join(account_dir, name)
+    
     auth_url = clone_url.replace("https://", f"https://{token}@")
 
     if os.path.exists(target_path):
-        return jsonify({"log": f"⚠️ 目录 {name} 已存在，跳过拉取。"})
+        return jsonify({"log": f"⚠️ 目录 {target_path} 已存在，跳过拉取。"})
     try:
         porcelain.clone(auth_url, target_path)
         
         now_str = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT INTO projects (name, path, repo_url, origin, last_sync) VALUES (?, ?, ?, ?, ?)", 
-                  (name, target_path, clone_url, "Cloud", now_str))
+        c.execute("INSERT INTO projects (name, path, repo_url, origin, last_sync, owner_name) VALUES (?, ?, ?, ?, ?, ?)", 
+                  (name, target_path, clone_url, "Cloud", now_str, owner_name))
         conn.commit()
         conn.close()
         
-        return jsonify({"log": f"✅ {name} 已成功拉取到本地。"})
+        return jsonify({"log": f"✅ {name} 已成功拉取到本地 (所属账号: {owner_name})。"})
     except Exception as e:
         return jsonify({"log": f"❌ 拉取失败: {str(e)}"})
 
 @app.route('/api/sync_check', methods=['POST'])
 def api_sync_check():
     data = request.json
-    p_name = data['name']
-    p_url = data['url']
-    p_path = os.path.join(BASE_DIR, p_name)
+    pid = data.get('id')
+    row = get_project_by_id(pid)
+    if not row:
+        return jsonify({"status": "error", "log": "❌ 找不到项目记录，可能已被删除。"})
+        
+    p_name, p_path, p_url, owner_name = row
     token = get_token()
 
     try:
@@ -1406,7 +1582,7 @@ def api_sync_check():
         remote_time = datetime.strptime(remote_date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(tz_utc8)
 
         if local_sha == remote_sha:
-            update_last_sync(p_name)
+            update_last_sync(pid)
             return jsonify({"status": "ok", "log": "🙌 本地与云端完全一致，无需同步。"})
 
         log_str = f"本地最后提交: {local_time.strftime('%m-%d %H:%M')} | 云端最后提交: {remote_time.strftime('%m-%d %H:%M')}"
@@ -1424,7 +1600,7 @@ def api_sync_check():
                  "log": f"{log_str}\n💡 本地数据较新，建议推送。"
              })
         
-        update_last_sync(p_name)
+        update_last_sync(pid)
         return jsonify({"status": "ok", "log": log_str + "\\n两端一致。"})
     except Exception as e:
         return jsonify({"status": "error", "log": f"❌ 同步比对失败: {str(e)}"})
@@ -1432,10 +1608,14 @@ def api_sync_check():
 @app.route('/api/recreate_push', methods=['POST'])
 def api_recreate_push():
     data = request.json
-    name = data['name']
-    is_private = data['is_private']
+    pid = data.get('id')
+    is_private = data.get('is_private')
+    
+    row = get_project_by_id(pid)
+    if not row: return jsonify({"log": "❌ 找不到项目记录"})
+    
+    name, target_path, p_url, _ = row
     token = get_token()
-    target_path = os.path.join(BASE_DIR, name)
 
     try:
         api_url = "https://api.github.com/user/repos"
@@ -1465,7 +1645,7 @@ def api_recreate_push():
         now_str = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("UPDATE projects SET repo_url = ?, origin = 'Local+Cloud', last_sync = ? WHERE name = ?", (clone_url, now_str, name))
+        c.execute("UPDATE projects SET repo_url = ?, origin = 'Local+Cloud', last_sync = ? WHERE id = ?", (clone_url, now_str, pid))
         conn.commit()
         conn.close()
 
@@ -1476,9 +1656,12 @@ def api_recreate_push():
 @app.route('/api/push', methods=['POST'])
 def api_push():
     data = request.json
-    name = data['name']
-    path = os.path.join(BASE_DIR, name)
-    auth_url = data['url'].replace("https://", f"https://{get_token()}@")
+    pid = data.get('id')
+    row = get_project_by_id(pid)
+    if not row: return jsonify({"log": "❌ 找不到项目记录"})
+    
+    name, path, repo_url, _ = row
+    auth_url = repo_url.replace("https://", f"https://{get_token()}@")
     default_committer = b"GitHubAutoTool <tool@localhost>"
     
     try:
@@ -1504,7 +1687,7 @@ def api_push():
         except Exception as pull_e:
             pull_msg = f"但自动拉取遇到问题: {str(pull_e)}"
 
-        update_last_sync(name)
+        update_last_sync(pid)
         return jsonify({"log": f"✅ 推送成功！{pull_msg}"})
     except Exception as e:
         return jsonify({"log": f"❌ 推送失败: {str(e)}"})
@@ -1512,21 +1695,30 @@ def api_push():
 @app.route('/api/pull_update', methods=['POST'])
 def api_pull_update():
     data = request.json
-    name = data['name']
-    path = os.path.join(BASE_DIR, name)
-    auth_url = data['url'].replace("https://", f"https://{get_token()}@")
+    pid = data.get('id')
+    row = get_project_by_id(pid)
+    if not row: return jsonify({"log": "❌ 找不到项目记录"})
+    
+    name, path, repo_url, _ = row
+    auth_url = repo_url.replace("https://", f"https://{get_token()}@")
+    
     try:
         porcelain.pull(path, auth_url)
-        update_last_sync(name)
+        update_last_sync(pid)
         return jsonify({"log": "✅ 拉取成功，本地已同步为云端最新代码。"})
     except Exception as e:
         return jsonify({"log": f"❌ 拉取更新失败: {str(e)}"})
 
 @app.route('/api/vscode', methods=['POST'])
 def api_vscode():
-    path = os.path.join(BASE_DIR, request.json['name'])
+    pid = request.json.get('id')
+    row = get_project_by_id(pid)
+    if not row: return jsonify({"log": "❌ 启动失败：找不到项目记录。"})
+    
+    path = row[1]
     if not os.path.exists(path):
         return jsonify({"log": "❌ 启动失败：找不到本地项目文件夹。"})
+        
     try:
         if os.name == 'nt':
             subprocess.Popen(f'code "{path}"', shell=True)
@@ -1538,9 +1730,14 @@ def api_vscode():
 
 @app.route('/api/open_folder', methods=['POST'])
 def api_open_folder():
-    path = os.path.join(BASE_DIR, request.json['name'])
+    pid = request.json.get('id')
+    row = get_project_by_id(pid)
+    if not row: return jsonify({"log": "❌ 打开失败：找不到项目记录。"})
+    
+    path = row[1]
     if not os.path.exists(path):
         return jsonify({"log": "❌ 打开失败：找不到本地项目文件夹。"})
+        
     try:
         if sys.platform == 'win32':
             os.startfile(path)
@@ -1554,8 +1751,12 @@ def api_open_folder():
 
 @app.route('/api/delete_local', methods=['POST'])
 def api_delete_local():
-    name = request.json['name']
-    path = os.path.join(BASE_DIR, name)
+    pid = request.json.get('id')
+    row = get_project_by_id(pid)
+    if not row: return jsonify({"log": "❌ 删除失败：找不到项目记录。"})
+    
+    name, path, _, _ = row
+    
     try:
         if os.path.exists(path):
             def remove_readonly(func, p, exc_info):
@@ -1578,7 +1779,7 @@ def api_delete_local():
         
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("DELETE FROM projects WHERE name = ?", (name,))
+        c.execute("DELETE FROM projects WHERE id = ?", (pid,))
         conn.commit()
         conn.close()
         return jsonify({"log": f"✅ 本地项目 {name} 已被彻底删除。"})
@@ -1591,8 +1792,7 @@ def api_create():
     name = data['name']
     is_private = data['is_private']
     token = get_token()
-    target_path = os.path.join(BASE_DIR, name)
-
+    
     try:
         api_url = "https://api.github.com/user/repos"
         payload = json.dumps({"name": name, "private": is_private}).encode()
@@ -1600,6 +1800,11 @@ def api_create():
         with proxy_urlopen(req) as res:
             repo_info = json.loads(res.read().decode())
             clone_url = repo_info['clone_url']
+            owner_name = repo_info['owner']['login']
+
+        account_dir = os.path.join(BASE_DIR, owner_name)
+        os.makedirs(account_dir, exist_ok=True)
+        target_path = os.path.join(account_dir, name)
 
         os.makedirs(target_path, exist_ok=True)
         porcelain.init(target_path)
@@ -1622,11 +1827,11 @@ def api_create():
         now_str = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT INTO projects (name, path, repo_url, origin, last_sync) VALUES (?, ?, ?, ?, ?)", 
-                  (name, target_path, clone_url, "Local+Cloud", now_str))
+        c.execute("INSERT INTO projects (name, path, repo_url, origin, last_sync, owner_name) VALUES (?, ?, ?, ?, ?, ?)", 
+                  (name, target_path, clone_url, "Local+Cloud", now_str, owner_name))
         conn.commit()
         conn.close()
-        return jsonify({"log": f"✅ 新项目 {name} 已在云端创建。"})
+        return jsonify({"log": f"✅ 新项目 {name} 已在云端创建并保存至 {owner_name} 分组。"})
     except Exception as e:
         return jsonify({"log": f"❌ 新建项目失败: {str(e)}"})
 
